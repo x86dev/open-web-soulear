@@ -1,9 +1,17 @@
 /**
- * UDP-Protokoll für AIR-Look WiFi Ear Camera (Enjoy-866, MoLink TX816).
+ * UDP protocol for the AIR-Look WiFi Ear Camera.
+ * Enjoy-866 device (MoLink TX816).
  *
- * Quellen: Wireshark pcap-Analyse der iOS-App (com.air.airlook).
- * Alle numerischen Felder little-endian, außer wo explizit angegeben.
+ * This module defines the packet layout and helpers used by the driver,
+ * including the discovery/status commands, the UDP video packet schema,
+ * and the JPEG reassembly logic.
+ *
+ * Credits for reverse engineering: https://github.com/lockieluke/airlook-protocol
  */
+
+export const DISCOVERY_PORT = 50000;
+export const VIDEO_PORT = 8032;
+export const CONTROL_PORT = 7060;
 
 export const DISCOVERY_MAGIC = 0x9999;
 export const VIDEO_MAGIC = 0x66;
@@ -11,15 +19,14 @@ export const HEADER_SIZE = 24;
 export const VIDEO_HEADER_SIZE = 24;
 
 export const MessageType = {
-  Discover: 0x1017,
-  GetStatus: 0x1017,
-  GetInfo: 0x1060,
+  DISCOVERY: 0x1060,
+  STATUS: 0x1710,
 } as const;
 
 export const PacketType = {
-  SOI: 0x01,  // Start Of Image
-  CONT: 0x03, // Continuation
-  EOI: 0x02,  // End Of Image
+  SOI: 0x01,
+  CONT: 0x03,
+  EOI: 0x02,
 } as const;
 
 export interface DeviceInfo {
@@ -40,13 +47,13 @@ export interface DeviceInfo {
 }
 
 export interface StatusReading {
-  voltage: number;    // Millivolts
-  battery: number;    // Percentage 0–100
+  voltage: number;
+  battery: number;
 }
 
 export interface VideoPacketHeader {
   magic: number;
-  type: number;       // SOI | CONT | EOI
+  type: number;
   streamId: number;
   frameId: number;
   seqNum: number;
@@ -54,72 +61,118 @@ export interface VideoPacketHeader {
   timestamp: number;
 }
 
+function formatHex(buf: Buffer): string {
+  return Array.from(buf)
+    .map((byte) => byte.toString(16).padStart(2, "0").toUpperCase())
+    .join(" ");
+}
+
 /**
- * Kodiert eine Discovery/GetStatus-Anfrage (24 Byte).
- * Typ ist little-endian u16 an Offset 2–3.
+ * Encodes a discovery request.
+ *
+ * The control packet is 24 bytes long, with the magic word at offset 0,
+ * the request type at offset 2-3, and the command identifier at offset 4-5.
  */
 export function encodeDiscoveryRequest(
-  messageType: number,
+  messageType: number = MessageType.DISCOVERY,
   cmdId: number = 0x04e2,
 ): Buffer {
   const buf = Buffer.alloc(HEADER_SIZE);
   buf.writeUInt16LE(DISCOVERY_MAGIC, 0);
   buf.writeUInt16LE(messageType, 2);
   buf.writeUInt16LE(cmdId, 4);
-  // Offset 6–23: Nullen (Padding)
+
+  console.log(`[AIRLOOK TX] discovery request -> ${formatHex(buf)}`);
   return buf;
 }
 
 /**
- * Dekodiert eine Discovery-Antwort.
- * Rückgabe: [Header (6 Byte), JSON-Payload als String].
+ * Encodes a status request.
+ *
+ * The status packet uses the same 0x9999 discovery magic and a status type
+ * value in the command field, followed by a zero-filled payload area.
  */
-export function parseDiscoveryResponse(buf: Buffer): [header: Buffer, payload: string] | null {
-  if (buf.length < 8 || buf.readUInt16LE(0) !== DISCOVERY_MAGIC) {
-    return null;
-  }
-  const header = buf.subarray(0, 6);
-  const jsonStartIndex = buf.indexOf('{');
-  if (jsonStartIndex === -1) {
-    return null;
-  }
-  const jsonString = buf.toString('utf8', jsonStartIndex);
-  return [header, jsonString];
+export function encodeStatusRequest(cmdId: number = 0x04e2): Buffer {
+  const buf = Buffer.alloc(HEADER_SIZE);
+  buf.writeUInt16LE(DISCOVERY_MAGIC, 0);
+  buf.writeUInt16LE(MessageType.STATUS, 2);
+  buf.writeUInt16LE(cmdId, 4);
+
+  console.log(`[AIRLOOK TX] status request -> ${formatHex(buf)}`);
+  return buf;
 }
 
 /**
- * Dekodiert eine Status-Antwort (Spannungs-/Akkupegel).
- * Format: 6 Byte Header + Status-Daten (2 unbekannt + 2 Spannung + 6 unbekannt
- * + 1 Akkuprozent + 7 unbekannt).
- */
-export function parseStatusResponse(buf: Buffer): StatusReading | null {
-  if (buf.length < 24) return null;
-  // Offset 8–9: Spannung in mV (little-endian u16)
-  const voltage = buf.readUInt16LE(8);
-  // Offset 16: Akkuprozent (u8)
-  const battery = buf.readUInt8(16);
-  return { voltage, battery };
-}
-
-/**
- * Kodiert das "Start Streaming"-Kommando für UDP 8032 (24 Byte).
+ * Encodes the UDP start-stream command used to keep the video stream alive.
  */
 export function encodeStartStreamingCommand(): Buffer {
   const buf = Buffer.alloc(HEADER_SIZE);
   buf.writeUInt16LE(DISCOVERY_MAGIC, 0);
   buf.writeUInt8(0x01, 2);
-  // Offset 3–23: Nullen (Padding)
+  buf.writeUInt8(0x00, 3);
+
+  console.log(`[AIRLOOK TX] start stream -> ${formatHex(buf)}`);
   return buf;
 }
 
 /**
- * Dekodiert einen Video-Packet-Header (erste 24 Byte eines Video-Packets).
+ * Parses a discovery response.
+ * The payload begins at the first JSON object brace in the reply.
  */
-export function parseVideoPacketHeader(buf: Buffer): VideoPacketHeader | null {
-  if (buf.length < VIDEO_HEADER_SIZE || buf[0] !== VIDEO_MAGIC) {
+export function parseDiscoveryResponse(
+  buf: Buffer,
+): [header: Buffer, payload: string] | null {
+  if (buf.length < 8 || buf.readUInt16LE(0) !== DISCOVERY_MAGIC) {
+    console.log(`[AIRLOOK RX] invalid discovery response -> ${formatHex(buf)}`);
     return null;
   }
-  return {
+
+  console.log(`[AIRLOOK RX] discovery response -> ${formatHex(buf)}`);
+
+  const header = buf.subarray(0, 6);
+  const jsonStartIndex = buf.indexOf("{");
+  if (jsonStartIndex === -1) {
+    console.log("[AIRLOOK RX] discovery response had no JSON payload");
+    return null;
+  }
+
+  const jsonString = buf.toString("utf8", jsonStartIndex);
+  return [header, jsonString];
+}
+
+/**
+ * Parses the battery voltage and percentage from a status response.
+ */
+export function parseStatusResponse(buf: Buffer): StatusReading | null {
+  if (buf.length < 24) {
+    console.log(`[AIRLOOK RX] status response too short -> ${formatHex(buf)}`);
+    return null;
+  }
+
+  console.log(`[AIRLOOK RX] status response -> ${formatHex(buf)}`);
+
+  if (buf.readUInt16LE(0) !== DISCOVERY_MAGIC) {
+    console.log("[AIRLOOK RX] status response magic mismatch");
+    return null;
+  }
+
+  if (buf.readUInt16LE(2) !== MessageType.STATUS) {
+    console.log("[AIRLOOK RX] status response type mismatch");
+    return null;
+  }
+
+  const voltage = buf.readUInt16LE(8);
+  const battery = buf.readUInt8(16);
+  return { voltage, battery };
+}
+
+export function parseVideoPacketHeader(buf: Buffer): VideoPacketHeader | null {
+  if (buf.length < VIDEO_HEADER_SIZE || buf[0] !== VIDEO_MAGIC) {
+    console.log(`[AIRLOOK RX] invalid video packet -> ${formatHex(buf)}`);
+    return null;
+  }
+
+  const header = {
     magic: buf[0],
     type: buf[1],
     streamId: buf.readUInt16BE(2),
@@ -128,6 +181,12 @@ export function parseVideoPacketHeader(buf: Buffer): VideoPacketHeader | null {
     payloadSize: buf.readUInt16BE(14),
     timestamp: buf.readUInt32BE(16),
   };
+
+  console.log(
+    `[AIRLOOK RX] video packet: type=${header.type} frameId=${header.frameId} streamId=${header.streamId} seq=${header.seqNum} payload=${header.payloadSize} ts=${header.timestamp}`,
+  );
+
+  return header;
 }
 
 export interface VideoPart {
@@ -136,18 +195,16 @@ export interface VideoPart {
   payload: Buffer;
 }
 
-/**
- * Parst einen Video-Packet aus einem UDP-Datagramm.
- * Rückgabe: VideoPart oder null.
- */
 export function parseVideoPacket(buf: Buffer): VideoPart | null {
   const header = parseVideoPacketHeader(buf);
-  if (!header) return null;
-  const payload = buf.subarray(VIDEO_HEADER_SIZE);
+  if (!header) {
+    return null;
+  }
+
   return {
     type: header.type,
     frameId: header.frameId,
-    payload,
+    payload: buf.subarray(VIDEO_HEADER_SIZE),
   };
 }
 
@@ -157,34 +214,48 @@ export interface AssembledFrame {
 }
 
 /**
- * Sammelt Video-Packets zu vollständigen JPEG-Frames.
- * Robust gegen Umordnung: SOI leitet neuen Frame ein, EOI schliesst ihn ab.
+ * Collects video packets into complete JPEG frames.
+ * The start-of-image packet begins a frame, continuation packets append data,
+ * and the end-of-image packet closes the frame.
  */
 export class VideoFrameAssembler {
-  private pendingFrames = new Map<number, Buffer>();
   private currentFrameId: number | null = null;
   private currentFrameData: Buffer[] = [];
 
-  /**
-   * Gibt fertige Frames zurück (meist 0 oder 1).
-   */
   push(part: VideoPart): AssembledFrame[] {
     const result: AssembledFrame[] = [];
 
     if (part.type === PacketType.SOI) {
-      // Neuer Frame beginnt – alten verwerfen falls vorhanden
       this.currentFrameId = part.frameId;
       this.currentFrameData = [part.payload];
-    } else if (part.type === PacketType.CONT && this.currentFrameId === part.frameId) {
+      return result;
+    }
+
+    if (part.type === PacketType.CONT && this.currentFrameId === part.frameId) {
       this.currentFrameData.push(part.payload);
-    } else if (part.type === PacketType.EOI && this.currentFrameId === part.frameId) {
+      return result;
+    }
+
+    if (part.type === PacketType.EOI && this.currentFrameId === part.frameId) {
       this.currentFrameData.push(part.payload);
-      const jpeg = Buffer.concat(this.currentFrameData);
-      // Validierung: Starts mit FFD8, endet mit FFD9
-      if (jpeg.length >= 4 && jpeg[0] === 0xff && jpeg[1] === 0xd8 &&
-          jpeg[jpeg.length - 2] === 0xff && jpeg[jpeg.length - 1] === 0xd9) {
+      const frame = Buffer.concat(this.currentFrameData);
+      const start = frame.indexOf(Buffer.from([0xff, 0xd8]));
+      const end = frame.lastIndexOf(Buffer.from([0xff, 0xd9]));
+
+      if (start >= 0 && end > start) {
+        const jpeg = frame.subarray(start, end + 2);
+        console.log(
+          `[AIRLOOK RX] assembled frame: id=${this.currentFrameId} size=${jpeg.length} bytes`,
+        );
         result.push({ frameId: this.currentFrameId, jpeg });
       }
+
+      this.currentFrameId = null;
+      this.currentFrameData = [];
+      return result;
+    }
+
+    if (part.frameId !== this.currentFrameId) {
       this.currentFrameId = null;
       this.currentFrameData = [];
     }
@@ -193,7 +264,6 @@ export class VideoFrameAssembler {
   }
 
   reset(): void {
-    this.pendingFrames.clear();
     this.currentFrameId = null;
     this.currentFrameData = [];
   }

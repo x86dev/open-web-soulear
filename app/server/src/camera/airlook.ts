@@ -1,41 +1,46 @@
+/*
+ * Driver for the AIR-Look WiFi Ear Camera.
+ * Enjoy-866 device (MoLink TX816).
+ *
+ * Credits for reverse engineering: https://github.com/lockieluke/airlook-protocol
+ */
+
 import dgram from "node:dgram";
+import net from "node:net";
 import {
-  DeviceInfo,
-  StatusReading,
-  VideoFrameAssembler,
-  PacketType,
-  encodeDiscoveryRequest,
-  encodeStartStreamingCommand,
+  CONTROL_PORT,
+  DISCOVERY_PORT,
+  VIDEO_PORT,
+  MessageType,
   parseDiscoveryResponse,
   parseStatusResponse,
   parseVideoPacket,
-} from "./airlook-protocol.js";
-import { CameraDriver } from "./types.js";
+  VideoFrameAssembler,
+  encodeDiscoveryRequest,
+  encodeStartStreamingCommand,
+  encodeStatusRequest,
+  type DeviceInfo,
+} from "./airlook-protocol.ts";
+import { CameraDriver } from "./types.ts";
 
 export interface AirlookOptions {
   ip: string;
-  /** Discovery und Status-Anfragen (50000). */
-  cmdPort: number;
-  /** Video-Stream (8032). */
-  videoPort: number;
+  cmdPort?: number;
+  videoPort?: number;
+  controlPort?: number;
   log: (msg: string) => void;
 }
 
-/** Timeout für Discovery/Status-Anfragen. */
 const REQUEST_TIMEOUT_MS = 3000;
-/** Länge des Heartbeats für Video-Streaming. */
 const VIDEO_HEARTBEAT_MS = 600;
-/** Länge ohne Bilddaten bevor Streaming neu gestartet wird. */
-const STALL_MS = 10000;
-/** Abstand für Status-Polling. */
-const STATUS_INTERVAL_MS = 2000;
+const STATUS_POLL_MS = 1800;
 
 /**
- * Treiber für AIR-Look WiFi Ear Camera (Enjoy-866, MoLink TX816, UDP-basiert).
+ * AIR-Look WiFi Ear Camera driver.
  *
- * Ablauf: Discovery → GetStatus (Akkustand) → Video-Streaming starten →
- * Chunks empfangen und zu JPEGs zusammensetzen. Regelmäßig Heartbeat
- * senden und Status abfragen.
+ * The driver follows the same control-flow pattern as the device protocol:
+ * discovery request, status polling, stream start command, periodic heartbeat,
+ * and JPEG reassembly from UDP video packets.
  */
 export class AirlookDriver extends CameraDriver {
   readonly name = "airlook";
@@ -43,15 +48,10 @@ export class AirlookDriver extends CameraDriver {
 
   private cmdSock: dgram.Socket | null = null;
   private videoSock: dgram.Socket | null = null;
+  private tcpSock: net.Socket | null = null;
   private readonly assembler = new VideoFrameAssembler();
-  private lastDataAt = 0;
-  private everReceived = false;
-  private stallError = false;
-  private restartPending = false;
-  private watchdog: NodeJS.Timeout | null = null;
-  private statusTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
-  private statusFailures = 0;
+  private statusTimer: NodeJS.Timeout | null = null;
   private deviceInfo: DeviceInfo | null = null;
 
   constructor(private readonly opts: AirlookOptions) {
@@ -59,149 +59,186 @@ export class AirlookDriver extends CameraDriver {
   }
 
   async connect(): Promise<void> {
-    if (this.connected) return;
+    if (this.connected) {
+      return;
+    }
+
     this.error = null;
-    this.everReceived = false;
+    this.cmdSock = dgram.createSocket({ type: "udp4", reuseAddr: true });
+    this.videoSock = dgram.createSocket({ type: "udp4", reuseAddr: true });
+
+    this.cmdSock.on("error", (err: Error) => {
+      console.error("[AIRLOOK] command socket error:", err.message);
+    });
+
+    this.videoSock.on("error", (err: Error) => {
+      console.error("[AIRLOOK] video socket error:", err.message);
+    });
+
+    this.videoSock.on("message", (buf) => this.onVideoData(buf));
+
+    this.cmdSock.bind(0);
+    this.videoSock.bind(0);
 
     try {
-      this.cmdSock = dgram.createSocket({ type: "udp4", reuseAddr: true });
-      this.cmdSock.on('error', (err: Error) => {
-        console.error('Command Socket Error:', err.message);
-      });
-
-      this.videoSock = dgram.createSocket({ type: "udp4", reuseAddr: true });
-      this.videoSock.on('error', (err: Error) => {
-        console.error('Video Socket Error:', err.message);
-      });
-
-      this.videoSock.on("message", (buf) => this.onVideoData(buf));
-
       await this.discover();
-      this.opts.log(`Kamera: ${this.deviceInfo?.model || "unbekannt"}`);
+      this.opts.log(`Camera: ${this.deviceInfo?.model ?? "unknown"}`);
 
       this.connected = true;
-      await this.startVideo();
+      this.connectTcp();
+      this.startVideo();
 
-      this.watchdog = setInterval(() => this.checkStall(), 1000);
-      this.statusTimer = setInterval(() => this.pollStatus(), STATUS_INTERVAL_MS);
       this.heartbeatTimer = setInterval(() => this.sendVideoHeartbeat(), VIDEO_HEARTBEAT_MS);
+      this.statusTimer = setInterval(() => this.pollStatus(), STATUS_POLL_MS);
     } catch (err) {
-      await this.teardown();
+      await this.disconnect();
       this.error = (err as Error).message;
       throw err;
     }
   }
 
   async disconnect(): Promise<void> {
-    await this.teardown();
-  }
+    this.connected = false;
 
-  // --- intern ---------------------------------------------------------------
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
 
-  private async teardown(): Promise<void> {
-    if (this.watchdog) clearInterval(this.watchdog);
-    if (this.statusTimer) clearInterval(this.statusTimer);
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    this.watchdog = this.statusTimer = this.heartbeatTimer = null;
+    if (this.statusTimer) {
+      clearInterval(this.statusTimer);
+      this.statusTimer = null;
+    }
+
+    this.tcpSock?.destroy();
+    this.tcpSock = null;
+
     this.cmdSock?.close();
     this.videoSock?.close();
     this.cmdSock = null;
     this.videoSock = null;
     this.assembler.reset();
-    this.connected = false;
   }
 
   private async discover(): Promise<void> {
-    const req = encodeDiscoveryRequest(0x1060);
-    console.log(req);
-    const res = await this.sendRequest(this.opts.cmdPort, req);
+    const req = encodeDiscoveryRequest();
+    const res = await this.sendRequest(this.opts.cmdPort ?? DISCOVERY_PORT, req);
     const parsed = parseDiscoveryResponse(res);
-    console.log(parsed);
+
     if (!parsed) {
       throw new Error(
-        `Kamera antwortet nicht (${this.opts.ip}:${this.opts.cmdPort}). Ist dieses Gerät im WLAN der Kamera?`,
+        `Camera did not respond (${this.opts.ip}:${this.opts.cmdPort ?? DISCOVERY_PORT}).`,
       );
     }
-    const [, payload] = parsed;
-    console.log('parsed: ');
-    console.log(parsed);
+
     try {
-      this.deviceInfo = JSON.parse(payload);
-    } catch {
-      throw new Error(`Discovery: Ungültige JSON-Antwort`);
+      this.deviceInfo = JSON.parse(parsed[1]) as DeviceInfo;
+      console.log("[AIRLOOK] discovery payload:", this.deviceInfo);
+    } catch (err) {
+      console.error("[AIRLOOK] discovery JSON parse error:", err);
+      throw new Error("Discovery: invalid JSON response");
     }
+
     this.details = {
       ...this.details,
-      Hersteller: this.deviceInfo?.manufacturer || "unbekannt",
-      Modell: this.deviceInfo?.model || "unbekannt",
-      Firmware: this.deviceInfo?.firmware || "unbekannt",
-      MAC: this.deviceInfo?.mac || "unbekannt",
+      manufacturer: this.deviceInfo?.manufacturer ?? "unknown",
+      model: this.deviceInfo?.model ?? "unknown",
+      firmware: this.deviceInfo?.firmware ?? "unknown",
+      mac: this.deviceInfo?.mac ?? "unknown",
     };
   }
 
   private async pollStatus(): Promise<void> {
     try {
-      const req = encodeDiscoveryRequest(0x1060);
-      const res = await this.sendRequest(this.opts.cmdPort, req);
+      const req = encodeStatusRequest();
+      const res = await this.sendStatusRequest(this.opts.cmdPort ?? DISCOVERY_PORT, req);
       const status = parseStatusResponse(res);
-      if (status) {
-        this.battery = Math.min(100, Math.max(0, status.battery));
-        this.details = { ...this.details, Spannung: `${status.voltage} mV` };
-        this.statusFailures = 0;
-        if (this.error === "Kamera antwortet nicht mehr auf Status-Abfragen") {
-          this.error = null;
-        }
+
+      if (!status) {
+        return;
       }
-    } catch {
-      if (++this.statusFailures >= 3) {
-        this.error = "Kamera antwortet nicht mehr auf Status-Abfragen";
-      }
+
+      this.battery = Math.min(100, Math.max(0, status.battery));
+      this.details = {
+        ...this.details,
+        voltage: `${status.voltage} mV`,
+      };
+      this.error = null;
+      console.log(`[AIRLOOK] status: voltage=${status.voltage} mV battery=${status.battery}%`);
+    } catch (err) {
+      console.warn("[AIRLOOK] status poll failed:", (err as Error).message);
     }
   }
 
-  private async startVideo(): Promise<void> {
+  private startVideo(): void {
+    const port = this.opts.videoPort ?? VIDEO_PORT;
     const req = encodeStartStreamingCommand();
-    try {
-      await this.sendRequest(this.opts.videoPort, req);
-      this.lastDataAt = Date.now();
-      this.opts.log(`Video-Stream gestartet`);
-    } catch (err) {
-      throw new Error(`StartVideo fehlgeschlagen: ${(err as Error).message}`);
-    }
+    this.videoSock?.send(req, port, this.opts.ip, (err) => {
+      if (err) {
+        console.error("[AIRLOOK] start video send error:", err.message);
+      }
+    });
   }
 
   private sendVideoHeartbeat(): void {
-    if (!this.connected) return;
+    if (!this.connected) {
+      return;
+    }
+
+    const port = this.opts.videoPort ?? VIDEO_PORT;
     const req = encodeStartStreamingCommand();
-    this.cmdSock?.send(req, this.opts.videoPort, this.opts.ip, () => undefined);
+    this.videoSock?.send(req, port, this.opts.ip, (err) => {
+      if (err) {
+        console.error("[AIRLOOK] heartbeat send error:", err.message);
+      }
+    });
   }
 
-  private checkStall(): void {
-    if (!this.connected || this.restartPending || Date.now() - this.lastDataAt < STALL_MS) return;
-    this.error = this.everReceived
-      ? "Bildstrom unterbrochen – starte neu"
-      : "Keine Bilddaten von der Kamera";
-    this.stallError = true;
-    this.opts.log(this.error);
-    this.lastDataAt = Date.now();
-    this.restartPending = true;
-    this.startVideo()
-      .catch((e) => this.opts.log(`StartVideo fehlgeschlagen: ${(e as Error).message}`))
-      .finally(() => (this.restartPending = false));
+  private connectTcp(): void {
+    const controlPort = this.opts.controlPort ?? CONTROL_PORT;
+    let attempts = 0;
+
+    const tryConnect = (): void => {
+      if (!this.connected || attempts >= 5) {
+        return;
+      }
+
+      const sock = net.createConnection({ host: this.opts.ip, port: controlPort });
+      sock.setTimeout(2000);
+
+      sock.once("connect", () => {
+        this.tcpSock = sock;
+        this.opts.log(`TCP connected to port ${controlPort}`);
+        console.log(`[AIRLOOK] tcp connected to ${this.opts.ip}:${controlPort}`);
+      });
+
+      sock.on("error", () => {
+        console.warn(`[AIRLOOK] TCP connection failed to ${this.opts.ip}:${controlPort}`);
+        sock.destroy();
+        attempts += 1;
+        if (this.connected) {
+          setTimeout(tryConnect, 1000);
+        }
+      });
+
+      sock.on("close", () => {
+        if (this.tcpSock === sock) {
+          this.tcpSock = null;
+        }
+      });
+    };
+
+    tryConnect();
   }
 
   private onVideoData(buf: Buffer): void {
-    const part = parseVideoPacket(buf);
-    if (!part) return;
-
-    this.lastDataAt = Date.now();
-    if (!this.everReceived) {
-      this.everReceived = true;
-      this.opts.log(`Erste Bilddaten empfangen`);
+    if (buf.length < 24 || buf[0] !== 0x66) {
+      return;
     }
-    if (this.stallError) {
-      this.stallError = false;
-      this.error = null;
+
+    const part = parseVideoPacket(buf);
+    if (!part) {
+      return;
     }
 
     for (const frame of this.assembler.push(part)) {
@@ -209,45 +246,74 @@ export class AirlookDriver extends CameraDriver {
     }
   }
 
-  /**
-   * Sendet eine Anfrage und wartet auf die Antwort.
-   */
   private sendRequest(port: number, data: Buffer, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Buffer> {
     return new Promise((resolve, reject) => {
-      const hexString = Array.from(data)
-        .map(byte => byte.toString(16).padStart(2, '0').toUpperCase())
-        .join(' ');
-      console.log(`Payload: [ ${hexString} ]`);
       const timer = setTimeout(() => {
-        reject(new Error(`Zeitüberschreitung (IP ${this.opts.ip}, Port ${port}`));
+        cleanup();
+        reject(new Error(`Request timed out while talking to ${this.opts.ip}:${port}`));
       }, timeoutMs);
 
-      const onMessage = (buf: Buffer, rinfo: dgram.RemoteInfo) => {
-        if (rinfo.address !== this.opts.ip) return;
+      const cleanup = () => {
         clearTimeout(timer);
         this.cmdSock?.off("message", onMessage);
+      };
+
+      const onMessage = (buf: Buffer, rinfo: dgram.RemoteInfo) => {
+        if (rinfo.address !== this.opts.ip) {
+          return;
+        }
+
+        console.log(`[AIRLOOK RX] request response from ${rinfo.address}:${rinfo.port} -> ${buf.length} bytes`);
+        cleanup();
         resolve(buf);
       };
 
-      this.cmdSock?.on("message", onMessage);
+      this.cmdSock?.once("message", onMessage);
       this.cmdSock?.send(data, port, this.opts.ip, (err) => {
         if (err) {
-          clearTimeout(timer);
-          this.cmdSock?.off("message", onMessage);
+          cleanup();
+          console.error("[AIRLOOK] UDP send failed:", err.message);
           reject(err);
         }
       });
+    });
+  }
 
-      if (this.cmdSock?.listening) {
-        this.cmdSock.on("message", onMessage);
-        this.cmdSock.send(data, port, this.opts.ip, (err) => {
-          if (err) {
-            clearTimeout(timer);
-            this.cmdSock?.off("message", onMessage);
-            reject(err);
-          }
-        });
-      }
+  private sendStatusRequest(port: number, data: Buffer, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const sock = dgram.createSocket({ type: "udp4" });
+      const timer = setTimeout(() => {
+        sock.close();
+        reject(new Error(`Status request timed out while talking to ${this.opts.ip}:${port}`));
+      }, timeoutMs);
+
+      const onMessage = (buf: Buffer, rinfo: dgram.RemoteInfo) => {
+        if (rinfo.address !== this.opts.ip) {
+          return;
+        }
+
+        console.log(`[AIRLOOK RX] status response from ${rinfo.address}:${rinfo.port} -> ${buf.length} bytes`);
+        clearTimeout(timer);
+        sock.close();
+        resolve(buf);
+      };
+
+      sock.once("message", onMessage);
+      sock.once("error", (err) => {
+        clearTimeout(timer);
+        sock.close();
+        console.error("[AIRLOOK] status socket error:", err.message);
+        reject(err);
+      });
+
+      sock.send(data, port, this.opts.ip, (err) => {
+        if (err) {
+          clearTimeout(timer);
+          sock.close();
+          console.error("[AIRLOOK] status send failed:", err.message);
+          reject(err);
+        }
+      });
     });
   }
 }
