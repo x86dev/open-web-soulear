@@ -2,6 +2,7 @@ import { config } from "../config.js";
 import { MockDriver } from "./mock.js";
 import { ReplayDriver } from "./replay.js";
 import { SoulearDriver } from "./soulear.js";
+import { AirlookDriver } from "./airlook.js";
 import type { CameraDriver } from "./types.js";
 
 export function createDriver(log: (msg: string) => void): CameraDriver {
@@ -16,6 +17,13 @@ export function createDriver(log: (msg: string) => void): CameraDriver {
         cmdPort: config.cameraCmdPort,
         videoPort: config.cameraVideoPort,
         streamPorts: config.streamPorts,
+        log,
+      });
+    case "airlook":
+      return new AirlookDriver({
+        ip: config.cameraIp,
+        cmdPort: config.cameraCmdPort,
+        videoPort: config.cameraVideoPort,
         log,
       });
   }

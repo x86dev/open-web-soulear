@@ -10,12 +10,21 @@ function env(name: string, fallback: string): string {
   return v === undefined || v === "" ? fallback : v;
 }
 
-export type DriverName = "mock" | "replay" | "soulear";
+export type DriverName = "mock" | "replay" | "soulear" | "airlook";
 
 const driver = env("DRIVER", "soulear");
-if (!["mock", "replay", "soulear"].includes(driver)) {
-  throw new Error(`Unbekannter DRIVER "${driver}" (erlaubt: mock, replay, soulear)`);
+if (!["mock", "replay", "soulear", "airlook"].includes(driver)) {
+  throw new Error(`Unbekannter DRIVER "${driver}" (erlaubt: mock, replay, soulear, airlook)`);
 }
+
+const driverDefaults: Record<DriverName, { cameraIp: string; cameraCmdPort: number; cameraVideoPort: number }> = {
+  mock: { cameraIp: "127.0.0.1", cameraCmdPort: 0, cameraVideoPort: 0 },
+  replay: { cameraIp: "127.0.0.1", cameraCmdPort: 0, cameraVideoPort: 0 },
+  soulear: { cameraIp: "192.168.1.1", cameraCmdPort: 10005, cameraVideoPort: 10006 },
+  airlook: { cameraIp: "192.168.0.10", cameraCmdPort: 50000, cameraVideoPort: 8032 },
+};
+
+const defaults = driverDefaults[driver as DriverName];
 
 export const config = {
   host: env("HOST", "127.0.0.1"),
@@ -30,10 +39,11 @@ export const config = {
   replayDir: path.resolve(env("REPLAY_DIR", path.join(appRoot, "captures", "frames"))),
   replayFps: Number(env("REPLAY_FPS", "15")),
 
-  /** soulear: Kamera im Kamera-WLAN (Ports laut Suear-Protokoll, siehe suear-protocol.ts). */
-  cameraIp: env("CAMERA_IP", "192.168.1.1"),
-  cameraCmdPort: Number(env("CAMERA_CMD_PORT", "10005")),
-  cameraVideoPort: Number(env("CAMERA_VIDEO_PORT", "10006")),
+  /** soulear/airlook: Kamera im Kamera-WLAN. Defaults je nach DRIVER. */
+  cameraIp: env("CAMERA_IP", defaults.cameraIp),
+  cameraCmdPort: Number(env("CAMERA_CMD_PORT", String(defaults.cameraCmdPort))),
+  cameraVideoPort: Number(env("CAMERA_VIDEO_PORT", String(defaults.cameraVideoPort))),
+
   /** Lokale UDP-Ports für den Bildstrom, der erste wird der Kamera mitgeteilt. */
   streamPorts: env("STREAM_PORTS", "22785,22789").split(",").map((p) => Number(p.trim())),
 };
