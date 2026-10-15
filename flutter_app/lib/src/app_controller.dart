@@ -7,8 +7,11 @@ import 'package:gal/gal.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'camera_client.dart';
+import 'airlook_client.dart';
+import 'auto_client.dart';
+import 'camera.dart';
 import 'protocol.dart';
+import 'soulear_client.dart';
 
 class StabilizeSettings {
   const StabilizeSettings({this.enabled = false, this.invert = false, this.offset = 270});
@@ -33,8 +36,18 @@ class AppController extends ChangeNotifier {
 
   static const _network = MethodChannel('soulear/network');
 
+  /// Default camera IP per driver. Used when the user has not edited the IP yet.
+  static const Map<String, String> _defaultIpByDriver = {
+    'auto': '192.168.1.1',
+    'soulear': '192.168.1.1',
+    'airlook': '192.168.0.10',
+  };
+
+  /// The default IP for the given [driver].
+  static String defaultIpFor(String driver) => _defaultIpByDriver[driver] ?? '192.168.1.1';
+
   late SharedPreferences _prefs;
-  CameraClient? _client;
+  CameraDriver? _client;
   final _subs = <StreamSubscription<Object?>>[];
 
   final frame = ValueNotifier<Frame?>(null);
@@ -44,7 +57,15 @@ class AppController extends ChangeNotifier {
   /// Drehwinkel fürs Livebild in Grad, null = nicht stabilisieren.
   final rotation = ValueNotifier<double?>(null);
 
-  String cameraIp = '192.168.1.1';
+  String cameraIp = defaultIpFor('auto');
+
+  /// 'auto' probiert die bekannten Treiber aus; sonst ein fester Treibername
+  /// ('soulear' oder 'airlook').
+  String driver = 'auto';
+
+  /// True once the user edited the IP themselves. Then the IP is kept when the
+  /// driver changes instead of falling back to the driver's default.
+  bool _ipUserEdited = false;
   StabilizeSettings stabilize = const StabilizeSettings();
   List<File> photos = [];
   bool connecting = false;
@@ -53,7 +74,11 @@ class AppController extends ChangeNotifier {
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
-    cameraIp = _prefs.getString('cameraIp') ?? cameraIp;
+    driver = _prefs.getString('driver') ?? driver;
+    _ipUserEdited = _prefs.getBool('ipUserEdited') ?? false;
+    // An explicitly saved IP wins; otherwise use the selected driver's default.
+    cameraIp = _prefs.getString('cameraIp') ??
+        (_ipUserEdited ? cameraIp : defaultIpFor(driver));
     stabilize = StabilizeSettings(
       enabled: _prefs.getBool('stab.enabled') ?? false,
       invert: _prefs.getBool('stab.invert') ?? false,
@@ -79,7 +104,7 @@ class AppController extends ChangeNotifier {
         debugPrint('WLAN-Bindung fehlgeschlagen: $e');
       }
     }
-    final client = CameraClient(config: CameraConfig(ip: cameraIp), log: (m) => debugPrint('[kamera] $m'));
+    final client = _createClient();
     _client = client;
     _subs
       ..add(client.frames.listen((f) => frame.value = f))
@@ -109,13 +134,42 @@ class AppController extends ChangeNotifier {
 
   Future<void> toggleLed() async {
     final c = _client;
-    if (c == null) return;
+    if (c == null || !c.capabilities.led) return;
     await c.setLed((status.value.led ?? 0) > 0 ? 0 : 100);
+  }
+
+  /// Baut je nach [driver] den passenden Treiber. „auto“ (Standard) versucht
+  /// soulear und airlook nacheinander.
+  CameraDriver _createClient() {
+    void log(String m) => debugPrint('[kamera] $m');
+    switch (driver) {
+      case 'soulear':
+        return SoulearClient(config: SoulearConfig(ip: cameraIp), log: log);
+      case 'airlook':
+        return AirlookClient(config: AirlookConfig(ip: cameraIp), log: log);
+      case 'auto':
+      default:
+        return AutoClient(ip: cameraIp, log: log);
+    }
   }
 
   Future<void> setCameraIp(String ip) async {
     cameraIp = ip.trim();
+    _ipUserEdited = true;
     await _prefs.setString('cameraIp', cameraIp);
+    await _prefs.setBool('ipUserEdited', true);
+    notifyListeners();
+    await connect();
+  }
+
+  /// Switches the driver. The IP follows the selected driver's default, unless
+  /// the user edited the IP explicitly before.
+  Future<void> setDriver(String name) async {
+    driver = name.trim();
+    if (!_ipUserEdited) cameraIp = defaultIpFor(driver);
+    await _prefs.setString('driver', driver);
+    if (!_ipUserEdited) await _prefs.setString('cameraIp', cameraIp);
+    notifyListeners();
     await connect();
   }
 

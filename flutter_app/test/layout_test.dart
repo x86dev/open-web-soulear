@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:soulear_local/main.dart';
 import 'package:soulear_local/src/app_controller.dart';
-import 'package:soulear_local/src/camera_client.dart';
+import 'package:soulear_local/src/camera.dart';
 import 'package:soulear_local/src/protocol.dart';
 
 /// Rendert die App in typischen Größen und prüft, dass nichts überläuft
@@ -22,6 +22,7 @@ void main() {
       fps: 17.3,
       battery: 57,
       led: 100,
+      capabilities: CameraCapabilities(led: true, battery: true, sensors: true),
       details: {
         'Hersteller': 'YPC',
         'Modell': 'BK7231U-XRH-FBPRO',

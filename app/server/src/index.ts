@@ -8,6 +8,9 @@ import { pipeMjpeg } from "./stream/mjpeg.js";
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
 const driver = createDriver((msg) => app.log.info(msg));
+
+await driver.init();
+
 const media = new MediaStore(config.mediaDir);
 await media.init();
 

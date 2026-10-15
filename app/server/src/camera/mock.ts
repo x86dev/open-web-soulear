@@ -1,13 +1,13 @@
 import jpeg from "jpeg-js";
-import { SensorSmoother } from "./suear-protocol.js";
-import { CameraDriver } from "./types.js";
+import { SensorSmoother } from "./suear-protocol.ts";
+import { CameraDriver, type ProbeResult } from "./types.ts";
 
 const WIDTH = 640;
 const HEIGHT = 480;
 
 /**
  * Künstliche Kamera für die Frontend-Entwicklung ohne Hardware: ein runder
- * „Ohrkanal“ mit wandernder Lichtquelle, LED-Helligkeit wirkt aufs Bild.
+ * „Ohrkanal" mit wandernder Lichtquelle, LED-Helligkeit wirkt aufs Bild.
  */
 export class MockDriver extends CameraDriver {
   readonly name = "mock";
@@ -18,17 +18,21 @@ export class MockDriver extends CameraDriver {
   private readonly rgba = Buffer.alloc(WIDTH * HEIGHT * 4);
   private readonly smoother = new SensorSmoother();
 
-  constructor(private readonly fps = 15) {
-    super();
+  constructor(fps = 15) {
+    super({ cameraIp: "127.0.0.1", cameraCmdPort: 0, cameraVideoPort: 0 });
     this.led = 80;
     this.battery = 100;
     this.details = { Modell: "Mock-Kamera", Auflösung: `${WIDTH}×${HEIGHT}` };
   }
 
+  async probe(): Promise<ProbeResult> {
+    return { compatible: true };
+  }
+
   async connect(): Promise<void> {
     if (this.timer) return;
     this.connected = true;
-    this.timer = setInterval(() => this.render(), 1000 / this.fps);
+    this.timer = setInterval(() => this.render(), 1000 / 15);
   }
 
   async disconnect(): Promise<void> {
@@ -44,9 +48,9 @@ export class MockDriver extends CameraDriver {
   private render(): void {
     this.tick++;
     // Akku entlädt sich langsam, damit die Anzeige etwas zu tun hat.
-    if (this.tick % (this.fps * 30) === 0 && this.battery! > 5) this.battery!--;
+    if (this.tick % (15 * 30) === 0 && this.battery! > 5) this.battery!--;
 
-    const t = this.tick / this.fps;
+    const t = this.tick / 15;
     const cx = WIDTH / 2;
     const cy = HEIGHT / 2;
     const r = Math.min(WIDTH, HEIGHT) * 0.45;

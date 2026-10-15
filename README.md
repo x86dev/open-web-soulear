@@ -99,9 +99,11 @@ DRIVER=mock npm run dev    # ohne Kamera ausprobieren
 
 Zusätzlich gibt es eine native App für Android (iOS vorbereitet) in
 [flutter_app/](flutter_app/README.md). Sie spricht **direkt** mit der Kamera –
-kein Rechner, kein Backend nötig. Gleicher Funktionsumfang: Livebild, Fotos
-(auch in die Galerie), LED, Akku, Lagesensor mit Stabilisierung. Getestet mit
-der echten Kamera auf Android 16.
+kein Rechner, kein Backend nötig. Sie kennt dieselben Treiber wie das Backend:
+**Soulear/Suear**, **AIR-Look** und **auto** (probiert beide nacheinander, ist
+Standard). Je nach Kamera: Livebild, Fotos (auch in die Galerie), LED, Akku,
+Lagesensor mit Stabilisierung. Getestet mit der echten Soulear-Kamera auf
+Android 16.
 
 <img src="docs/screenshot-android.png" alt="Soulear lokal als Android-App mit der echten Kamera: stabilisiertes Livebild, Bedienknöpfe und Tab Lage mit Sensorwerten" width="300">
 

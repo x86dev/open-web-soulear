@@ -11,24 +11,22 @@ import {
   parseDeviceInfo,
   SensorSmoother,
   type Message,
-} from "./suear-protocol.js";
-import { CameraDriver } from "./types.js";
-
-export interface SoulearOptions {
-  ip: string;
-  /** Befehle (GetDeviceInfo, SetLed, …). */
-  cmdPort: number;
-  /** OpenVideo. */
-  videoPort: number;
-  /** Lokale Ports, auf denen die Kamera die Bild-Chunks anliefert. */
-  streamPorts: number[];
-  log: (msg: string) => void;
-}
+} from "./suear-protocol.ts";
+import { CameraDriver, type DriverConfig, type ProbeResult } from "./types.js";
 
 /** Ohne Bilddaten so lange warten, bevor OpenVideo erneut gesendet wird. */
 const STALL_MS = 6000;
 const INFO_INTERVAL_MS = 10000;
 const INFO_LOST = "Kamera antwortet nicht mehr auf Statusabfragen";
+const PROBE_TIMEOUT_MS = 1500;
+/**
+ * Wie lange der bevorzugte Bild-Port gehalten/erneut versucht wird, bevor auf
+ * die übrigen Ports zurückgefallen wird. Der erste Port ist der, den Kameras
+ * in der Regel erwarten – ein belegter Port ist oft nur ein Rest des vorigen
+ * Prozesses, der nach kurzer Zeit verschwindet.
+ */
+const STREAM_PORT_RETRY_MS = 3000;
+const STREAM_PORT_RETRY_INTERVAL_MS = 250;
 
 /**
  * Treiber für Soulear/Suear-Kameras (UDP, siehe suear-protocol.ts).
@@ -59,31 +57,91 @@ export class SoulearDriver extends CameraDriver {
   private infoTimer: NodeJS.Timeout | null = null;
   private infoFailures = 0;
   private ledLogged = false;
+  /**
+   * Ports der Kamera, von denen gerade eine Befehlsantwort erwartet wird.
+   * Datagramme dieser Quellports auf dem Befehls-Socket sind keine Bilddaten.
+   */
+  private readonly pendingReplyPorts = new Set<number>();
+  /** In Reihenfolge erfolgreich gebundene Bild-Ports; der erste wird beworben. */
+  private boundStreamPorts: number[] = [];
 
-  constructor(private readonly opts: SoulearOptions) {
-    super();
+  constructor(
+    config: DriverConfig,
+    private log: (msg: string) => void,
+  ) {
+    super(config);
+  }
+
+  async init(): Promise<boolean> {
+    this.error = null;
+    this.cmdSock = await bindUdp(0);
+    // Wie in der Handy-App: die Kamera schickt den Bildstrom an den Quellport
+    // der OpenVideo-Anfrage – also an genau diesen Socket. Deshalb hier sowohl
+    // Befehlsantworten als auch Bilddaten verarbeiten.
+    const cmdLocalPort = this.cmdSock.address().port;
+    this.cmdSock.on("message", (buf, rinfo) => {
+      // Nur echte, zur offenen Anfrage passende Antworten aussortieren. Bild-
+      // Chunks (kein gültiger Nachrichten-Header) dürfen NIE verschluckt werden.
+      if (this.isCommandReply(buf, rinfo)) return; // wird von requestOnce verarbeitet
+      this.onStreamData(buf, rinfo, cmdLocalPort);
+    });
+    return true;
+  }
+
+  async destroy(): Promise<void> {
+    await this.teardown();
+    return;
+  }
+
+  async probe(): Promise<ProbeResult> {
+    try {
+      const packet = encodeMessage(0, MsgType.GetDeviceInfo);
+      const res = await this.probeRequest(this.config.cameraCmdPort, packet, PROBE_TIMEOUT_MS);
+      const decoded = decodeMessage(res);
+
+      if (!decoded || decoded.type !== MsgType.GetDeviceInfo) {
+        return { compatible: false, reason: "Invalid device info response" };
+      }
+
+      const info = parseDeviceInfo(decoded.data);
+      if (!info) {
+        return { compatible: false, reason: "Could not parse device info" };
+      }
+
+      console.log(`[SOULEAR] probe success: ${info.vendor} ${info.product}`);
+      return { compatible: true };
+    } catch (err) {
+      console.log(`[SOULEAR] probe failed: ${(err as Error).message}`);
+      return {
+        compatible: false,
+        reason: (err as Error).message,
+      };
+    }
   }
 
   async connect(): Promise<void> {
-    if (this.connected) return;
-    this.error = null;
-    this.everReceived = false;
-    try {
-      this.cmdSock = await bindUdp(0);
+    if (this.connected)
+      return;
 
+    // Jede Verbindung wie ein frischer Client beginnen.
+    this.everReceived = false;
+    this.openMode = "port";
+    this.boundStreamPorts = [];
+
+    try {
       const info = await this.updateInfo().catch(() => {
         throw new Error(
-          `Kamera antwortet nicht (${this.opts.ip}:${this.opts.cmdPort}). Ist dieses Gerät im WLAN der Kamera?`,
+          `Kamera antwortet nicht (${this.config.cameraIp}:${this.config.cameraCmdPort}). Ist dieses Gerät im WLAN der Kamera?`,
         );
       });
-      this.opts.log(`Kamera: ${info}`);
+      this.log(`Kamera: ${info}`);
 
       await this.openStreamSockets();
       this.connected = true;
       await this.openVideo();
 
       // Wie die Original-App: nach dem Verbinden Licht an.
-      await this.setLed(100).catch((e) => this.opts.log(`LED einschalten fehlgeschlagen: ${(e as Error).message}`));
+      await this.setLed(100).catch((e) => this.log(`LED einschalten fehlgeschlagen: ${(e as Error).message}`));
 
       this.watchdog = setInterval(() => this.checkStall(), 1000);
       this.infoTimer = setInterval(() => this.pollInfo(), INFO_INTERVAL_MS);
@@ -99,7 +157,7 @@ export class SoulearDriver extends CameraDriver {
   }
 
   override async setLed(level: number): Promise<void> {
-    const res = await this.request(this.opts.cmdPort, MsgType.SetLed, ledPayload(level));
+    const res = await this.request(this.config.cameraCmdPort, MsgType.SetLed, ledPayload(level));
     if (res.errCode !== 0) throw new Error(`SetLed: Fehlercode ${res.errCode}`);
     this.led = Math.max(0, Math.min(100, Math.round(level)));
     // Anzeige nach dem tatsächlichen Zustand der Kamera richten.
@@ -108,11 +166,11 @@ export class SoulearDriver extends CameraDriver {
 
   /** Liest den LED-Zustand von der Kamera; bei unlesbarer Antwort bleibt der alte Wert. */
   private async readLed(): Promise<void> {
-    const res = await this.request(this.opts.cmdPort, MsgType.SetLed, ledQueryPayload());
+    const res = await this.request(this.config.cameraCmdPort, MsgType.SetLed, ledQueryPayload());
     const level = parseLedStatus(res.data);
     if (!this.ledLogged) {
       this.ledLogged = true;
-      this.opts.log(`LED-Abfrage: Antwort ${res.data.toString("hex") || "(leer)"} → ${level ?? "unlesbar"}`);
+      this.log(`LED-Abfrage: Antwort ${res.data.toString("hex") || "(leer)"} → ${level ?? "unlesbar"}`);
     }
     if (level !== null) this.led = level;
   }
@@ -123,16 +181,19 @@ export class SoulearDriver extends CameraDriver {
     if (this.watchdog) clearInterval(this.watchdog);
     if (this.infoTimer) clearInterval(this.infoTimer);
     this.watchdog = this.infoTimer = null;
+    for (const s of [this.cmdSock, ...this.streamSocks]) s?.removeAllListeners();
     for (const s of [this.cmdSock, ...this.streamSocks]) s?.close();
     this.cmdSock = null;
     this.streamSocks = [];
     this.assembler.reset();
     this.smoother.reset();
+    this.pendingReplyPorts.clear();
+    this.boundStreamPorts = [];
     this.connected = false;
   }
 
   private async updateInfo(): Promise<string> {
-    const res = await this.request(this.opts.cmdPort, MsgType.GetDeviceInfo);
+    const res = await this.request(this.config.cameraCmdPort, MsgType.GetDeviceInfo);
     const info = parseDeviceInfo(res.data);
     if (!info) throw new Error(`GetDeviceInfo: unerwartete Antwort (${res.data.length} Byte)`);
     this.battery = Math.min(100, info.battery);
@@ -159,17 +220,43 @@ export class SoulearDriver extends CameraDriver {
   }
 
   private async openStreamSockets(): Promise<void> {
-    const results = await Promise.allSettled(this.opts.streamPorts.map((p) => bindUdp(p)));
-    results.forEach((r, i) => {
-      const port = this.opts.streamPorts[i]!;
-      if (r.status === "rejected") {
-        this.opts.log(`Bild-Port ${port} nicht nutzbar: ${(r.reason as Error).message}`);
-        return;
+    this.boundStreamPorts = [];
+    const ports = this.config.cameraStreamPorts ?? [];
+
+    // Bevorzugten Port zuerst – und über das Zeitfenster hinweg erneut versuchen,
+    // damit ein gerade noch belegter Port (Prozessrest, Neustart) den Bildstrom
+    // nicht auf einen Port umleitet, den die Kamera nicht kennt.
+    for (const port of ports) {
+      const sock = await this.bindStreamPort(port, this.boundStreamPorts.length === 0);
+      if (sock) return; // erster erfolgreich gebundener Port wird beworben
+    }
+    throw new Error(`Keiner der Bild-Ports ${ports.join("/")} ist frei`);
+  }
+
+  /**
+   * Bindet einen Bild-Port. Der erste (bevorzugte) Port wird für
+   * `STREAM_PORT_RETRY_MS` wiederholt versucht, bevor er aufgibt; weitere Ports
+   * werden sofort einmal versucht. Gibt bei Erfolg den Socket zurück und öffnet
+   * den Nachrichten-Empfang.
+   */
+  private async bindStreamPort(port: number, isPreferred: boolean): Promise<dgram.Socket | null> {
+    const deadline = Date.now() + (isPreferred ? STREAM_PORT_RETRY_MS : 0);
+    for (;;) {
+      try {
+        const sock = await bindUdp(port);
+        sock.on("message", (buf, rinfo) => this.onStreamData(buf, rinfo, port));
+        this.streamSocks.push(sock);
+        this.boundStreamPorts.push(port);
+        return sock;
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (Date.now() >= deadline) {
+          this.log(`Bild-Port ${port} nicht nutzbar: ${msg}`);
+          return null;
+        }
+        await delay(STREAM_PORT_RETRY_INTERVAL_MS);
       }
-      r.value.on("message", (buf, rinfo) => this.onStreamData(buf, rinfo, port));
-      this.streamSocks.push(r.value);
-    });
-    if (this.streamSocks.length === 0) throw new Error(`Keiner der Bild-Ports ${this.opts.streamPorts.join("/")} ist frei`);
+    }
   }
 
   private async openVideo(): Promise<void> {
@@ -179,7 +266,7 @@ export class SoulearDriver extends CameraDriver {
       // Ältere Firmware kennt die Port-Nutzlast evtl. nicht → ohne versuchen.
       // Hat der Port-Modus schon Bilder geliefert, ist es nur ein Ausfall.
       if (this.openMode !== "port" || this.everReceived) throw err;
-      this.opts.log(`OpenVideo mit Port fehlgeschlagen (${(err as Error).message}) – versuche ohne Nutzlast`);
+      this.log(`OpenVideo mit Port fehlgeschlagen (${(err as Error).message}) – versuche ohne Nutzlast`);
       this.openMode = "plain";
       await this.sendOpenVideo();
     }
@@ -187,14 +274,25 @@ export class SoulearDriver extends CameraDriver {
 
   private async sendOpenVideo(): Promise<void> {
     let payload = Buffer.alloc(0);
+    let advertised: number | null = null;
     if (this.openMode === "port") {
+      // Nur einen Port bewerben, der auch wirklich gebunden ist – sonst schickt
+      // die Kamera den Bildstrom ins Leere, während der Befehlskanal läuft.
+      advertised = this.boundStreamPorts[0]!;
       payload = Buffer.alloc(2);
-      payload.writeUInt16LE(this.opts.streamPorts[0]!, 0);
+      payload.writeUInt16LE(advertised, 0);
     }
-    const res = await this.request(this.opts.videoPort, MsgType.OpenVideo, payload);
+    // Wichtig: OpenVideo vom Bild-Socket aus senden, nicht vom Befehls-Socket.
+    // Die Kamera schickt den Strom an den Quellport der Anfrage – so landet er
+    // garantiert auf dem Socket, auf dem schon auf Chunks gehört wird (wie beim
+    // Ein-Socket-Client der Handy-App).
+    const streamSock = this.streamSocks[0];
+    const res = streamSock
+      ? await this.requestOn(streamSock, this.config.cameraVideoPort, MsgType.OpenVideo, payload)
+      : await this.request(this.config.cameraVideoPort, MsgType.OpenVideo, payload);
     if (res.errCode !== 0) throw new Error(`OpenVideo (${this.openMode}): Fehlercode ${res.errCode}`);
     this.lastDataAt = Date.now();
-    this.opts.log(`OpenVideo gesendet (Modus ${this.openMode})`);
+    this.log(`OpenVideo gesendet (Modus ${this.openMode})`);
   }
 
   private checkStall(): void {
@@ -204,21 +302,33 @@ export class SoulearDriver extends CameraDriver {
       ? "Bildstrom unterbrochen – starte neu"
       : "Keine Bilddaten von der Kamera – versuche anderen Startmodus";
     this.stallError = true;
-    this.opts.log(this.error);
+    this.log(this.error);
     this.lastDataAt = Date.now(); // nicht bei jedem Tick erneut versuchen
     this.restartPending = true;
     this.openVideo()
-      .catch((e) => this.opts.log(`OpenVideo fehlgeschlagen: ${(e as Error).message}`))
+      .catch((e) => this.log(`OpenVideo fehlgeschlagen: ${(e as Error).message}`))
       .finally(() => (this.restartPending = false));
   }
 
+  /**
+   * Ist das Datagramm die Antwort auf eine gerade offene Anfrage? Dann gehört
+   * es `requestOnce` und darf nicht als Bildstrom verarbeitet werden. Wichtig:
+   * nur echte Nachrichten (gültiger Header + erwarteter Typ) zählen als Antwort
+   * – Bild-Chunks vom selben Quellport (10006) müssen durchgelassen werden.
+   */
+  private isCommandReply(buf: Buffer, rinfo: dgram.RemoteInfo): boolean {
+    if (!this.pendingReplyPorts.has(rinfo.port)) return false;
+    const msg = decodeMessage(buf);
+    return msg !== null;
+  }
+
   private onStreamData(buf: Buffer, rinfo: dgram.RemoteInfo, port: number): void {
-    if (rinfo.address !== this.opts.ip) return;
+    if (rinfo.address !== this.config.cameraIp) return;
     this.lastDataAt = Date.now();
     if (!this.everReceived) {
       this.everReceived = true;
       this.details = { ...this.details, Empfangsport: String(port), Startmodus: this.openMode };
-      this.opts.log(`Erste Bilddaten auf Port ${port} (Startmodus ${this.openMode})`);
+      this.log(`Erste Bilddaten auf Port ${port} (Startmodus ${this.openMode})`);
     }
     if (this.stallError) {
       this.stallError = false;
@@ -256,13 +366,45 @@ export class SoulearDriver extends CameraDriver {
     return p;
   }
 
-  private requestOnce(port: number, type: number, data: Buffer | undefined, timeoutMs: number): Promise<Message> {
+  private async requestOnce(port: number, type: number, data: Buffer | undefined, timeoutMs: number): Promise<Message> {
     const sock = this.cmdSock;
     if (!sock) return Promise.reject(new Error("nicht verbunden"));
+    return this.sendRequestOn(sock, port, type, data, timeoutMs);
+  }
+
+  /**
+   * Wie `request`, aber über einen bestimmten Socket (z. B. den Bild-Socket für
+   * OpenVideo). Serialisiert mit allen anderen Anfragen.
+   */
+  private requestOn(sock: dgram.Socket, port: number, type: number, data: Buffer, timeoutMs = 1500, attempts = 3): Promise<Message> {
+    const run = async (): Promise<Message> => {
+      let lastErr: Error = new Error("keine Antwort");
+      for (let i = 0; i < attempts; i++) {
+        try {
+          return await this.sendRequestOn(sock, port, type, data, timeoutMs);
+        } catch (e) {
+          lastErr = e as Error;
+        }
+      }
+      throw lastErr;
+    };
+    const p = this.queue.then(run, run);
+    this.queue = p.catch(() => undefined);
+    return p;
+  }
+
+  private sendRequestOn(
+    sock: dgram.Socket,
+    port: number,
+    type: number,
+    data: Buffer | undefined,
+    timeoutMs: number,
+  ): Promise<Message> {
     const packet = encodeMessage(this.msgId++, type, data);
+    this.pendingReplyPorts.add(port);
     return new Promise((resolve, reject) => {
       const onMessage = (buf: Buffer, rinfo: dgram.RemoteInfo) => {
-        if (rinfo.address !== this.opts.ip || rinfo.port !== port) return;
+        if (rinfo.address !== this.config.cameraIp || rinfo.port !== port) return;
         const msg = decodeMessage(buf);
         if (!msg || msg.type !== type) return;
         cleanup();
@@ -275,9 +417,10 @@ export class SoulearDriver extends CameraDriver {
       const cleanup = () => {
         clearTimeout(timer);
         sock.off("message", onMessage);
+        this.pendingReplyPorts.delete(port);
       };
       sock.on("message", onMessage);
-      sock.send(packet, port, this.opts.ip, (err) => {
+      sock.send(packet, port, this.config.cameraIp, (err) => {
         if (err) {
           cleanup();
           reject(err);
@@ -285,16 +428,58 @@ export class SoulearDriver extends CameraDriver {
       });
     });
   }
+
+  private probeRequest(
+    port: number,
+    data: Buffer,
+    timeoutMs: number,
+  ): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const sock = dgram.createSocket({ type: "udp4", reuseAddr: false });
+      const timer = setTimeout(() => {
+        sock.close();
+        reject(new Error("probe timeout"));
+      }, timeoutMs);
+
+      const onMessage = (buf: Buffer, rinfo: dgram.RemoteInfo) => {
+        if (rinfo.address !== this.config.cameraIp || rinfo.port !== port) return;
+        clearTimeout(timer);
+        sock.close();
+        resolve(buf);
+      };
+
+      sock.once("message", onMessage);
+      sock.once("error", () => {
+        clearTimeout(timer);
+        sock.close();
+        reject(new Error("socket error"));
+      });
+
+      sock.send(data, port, this.config.cameraIp, (err) => {
+        if (err) {
+          clearTimeout(timer);
+          sock.close();
+          reject(err);
+        }
+      });
+    });
+  }
 }
 
-function bindUdp(port: number): Promise<dgram.Socket> {
+function bindUdp(port: number, reuseAddr = true): Promise<dgram.Socket> {
   return new Promise((resolve, reject) => {
-    const sock = dgram.createSocket({ type: "udp4", reuseAddr: false });
+    // `reuseAddr` wie RawDatagramSocket.bind in der Handy-App (Dart-Default true).
+    const sock = dgram.createSocket({ type: "udp4", reuseAddr });
     sock.once("error", reject);
-    sock.bind(port, () => {
+    // Wie Dart: ausdrücklich auf allen IPv4-Adressen lauschen (0.0.0.0).
+    sock.bind(port, "0.0.0.0", () => {
       sock.off("error", reject);
       sock.on("error", () => undefined); // spätere ICMP-Fehler nicht als Absturz werten
       resolve(sock);
     });
   });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

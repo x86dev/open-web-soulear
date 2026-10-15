@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../src/app_controller.dart';
-import '../src/camera_client.dart';
+import '../src/camera.dart';
 import 'device_tab.dart';
 import 'live_view.dart';
 import 'photos_tab.dart';
@@ -167,6 +167,7 @@ class _Controls extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final ledOn = (status.led ?? 0) > 0;
+    final canLed = status.capabilities.led;
     final stab = controller.stabilize.enabled;
     Future<void> photo() async {
       final msg = await controller.takePhoto();
@@ -179,15 +180,17 @@ class _Controls extends StatelessWidget {
       label: const Text('Foto aufnehmen'),
       style: FilledButton.styleFrom(minimumSize: const Size(0, 48)),
     );
-    final ledBtn = ledOn
-        ? FilledButton.tonalIcon(
-            onPressed: status.connected ? controller.toggleLed : null,
-            icon: const Icon(Icons.flashlight_on),
-            label: const Text('LED an'))
-        : OutlinedButton.icon(
-            onPressed: status.connected ? controller.toggleLed : null,
-            icon: const Icon(Icons.flashlight_off),
-            label: const Text('LED aus'));
+    final ledBtn = !canLed
+        ? null
+        : ledOn
+            ? FilledButton.tonalIcon(
+                onPressed: status.connected ? controller.toggleLed : null,
+                icon: const Icon(Icons.flashlight_on),
+                label: const Text('LED an'))
+            : OutlinedButton.icon(
+                onPressed: status.connected ? controller.toggleLed : null,
+                icon: const Icon(Icons.flashlight_off),
+                label: const Text('LED aus'));
     final stabBtn = stab
         ? FilledButton.tonalIcon(
             onPressed: () => controller.setStabilize(controller.stabilize.copyWith(enabled: false)),
@@ -213,8 +216,7 @@ class _Controls extends StatelessWidget {
             photoBtn,
             const SizedBox(height: 8),
             Row(children: [
-              Expanded(child: ledBtn),
-              const SizedBox(width: 8),
+              if (ledBtn != null) ...[Expanded(child: ledBtn), const SizedBox(width: 8)],
               Expanded(child: stabBtn),
               reconnect,
             ]),
@@ -222,8 +224,7 @@ class _Controls extends StatelessWidget {
         }
         return Row(children: [
           photoBtn,
-          const SizedBox(width: 8),
-          ledBtn,
+          if (ledBtn != null) ...[const SizedBox(width: 8), ledBtn],
           const SizedBox(width: 8),
           stabBtn,
           const Spacer(),

@@ -1,19 +1,20 @@
-/// Kamera-Client für Soulear/Suear-Kameras (UDP). Reines Dart (dart:io), läuft
-/// in der App und als Kommandozeilen-Programm (tool/probe.dart).
+/// Camera driver for Soulear/Suear cameras (UDP). Pure Dart (dart:io), runs in
+/// the app and as a command-line program (tool/probe.dart).
 ///
-/// Ablauf wie app/server/src/camera/soulear.ts: GetDeviceInfo → Bild-Ports
-/// öffnen → OpenVideo (erst mit eigenem Empfangsport als Nutzlast, bei Fehler
-/// ohne) → Chunks zu JPEGs zusammensetzen. Bleiben Bilddaten aus, wird
-/// OpenVideo wiederholt.
+/// Flow as in app/server/src/camera/soulear.ts: GetDeviceInfo -> open video
+/// ports -> OpenVideo (first with our own receive port as payload, on failure
+/// without) -> assemble chunks into JPEGs. If no video data arrives, OpenVideo
+/// is repeated.
 library;
 
 import 'dart:async';
 import 'dart:io';
 
+import 'camera.dart';
 import 'protocol.dart';
 
-class CameraConfig {
-  const CameraConfig({
+class SoulearConfig {
+  const SoulearConfig({
     this.ip = '192.168.1.1',
     this.cmdPort = 10005,
     this.videoPort = 10006,
@@ -25,70 +26,20 @@ class CameraConfig {
   final List<int> streamPorts;
 }
 
-class CameraStatus {
-  const CameraStatus({
-    this.connected = false,
-    this.fps = 0,
-    this.battery,
-    this.charging = false,
-    this.led,
-    this.error,
-    this.details = const {},
-  });
-  final bool connected;
-  final double fps;
-  final int? battery;
-  final bool charging;
+class SoulearClient extends BaseCameraDriver {
+  SoulearClient({this.config = const SoulearConfig(), this.log = _noLog});
 
-  /// 0–100, null wenn unbekannt.
-  final int? led;
-  final String? error;
-  final Map<String, String> details;
-
-  CameraStatus copyWith({
-    bool? connected,
-    double? fps,
-    int? battery,
-    bool? charging,
-    int? led,
-    String? error,
-    bool clearError = false,
-    Map<String, String>? details,
-  }) =>
-      CameraStatus(
-        connected: connected ?? this.connected,
-        fps: fps ?? this.fps,
-        battery: battery ?? this.battery,
-        charging: charging ?? this.charging,
-        led: led ?? this.led,
-        error: clearError ? null : (error ?? this.error),
-        details: details ?? this.details,
-      );
-}
-
-class CameraClient {
-  CameraClient({this.config = const CameraConfig(), this.log = _noLog});
-
-  final CameraConfig config;
+  final SoulearConfig config;
   final void Function(String) log;
+
+  @override
+  String get name => 'soulear';
+
+  @override
+  CameraCapabilities get capabilities => const CameraCapabilities(led: true, battery: true, sensors: true);
 
   static const _stall = Duration(seconds: 6);
   static const _infoInterval = Duration(seconds: 10);
-
-  final _frames = StreamController<Frame>.broadcast();
-  final _sensors = StreamController<SensorReading>.broadcast();
-  final _statusCtrl = StreamController<CameraStatus>.broadcast();
-
-  /// Fertige JPEG-Bilder.
-  Stream<Frame> get frames => _frames.stream;
-
-  /// Geglättete Lagesensor-Werte, eines pro Bild.
-  Stream<SensorReading> get sensors => _sensors.stream;
-  Stream<CameraStatus> get statusStream => _statusCtrl.stream;
-  CameraStatus get status => _status;
-
-  CameraStatus _status = const CameraStatus();
-  Frame? lastFrame;
 
   RawDatagramSocket? _cmd;
   final _streamSocks = <RawDatagramSocket>[];
@@ -106,17 +57,13 @@ class CameraClient {
   Timer? _watchdog;
   Timer? _infoTimer;
   int _infoFailures = 0;
-  final _frameTimes = <DateTime>[];
 
-  void _setStatus(CameraStatus s) {
-    _status = s;
-    if (!_statusCtrl.isClosed) _statusCtrl.add(s);
-  }
-
+  @override
   Future<void> connect() async {
-    if (_status.connected) return;
-    _setStatus(_status.copyWith(clearError: true));
+    if (status.connected) return;
+    setStatus(status.copyWith(clearError: true, capabilities: capabilities));
     _everReceived = false;
+    _usePortPayload = true;
     try {
       _addr = InternetAddress(config.ip);
       _cmd = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
@@ -134,10 +81,10 @@ class CameraClient {
       log('Kamera: $info');
 
       await _openStreamSockets();
-      _setStatus(_status.copyWith(connected: true));
+      setStatus(status.copyWith(connected: true));
       await _openVideo();
 
-      // Wie die Original-App: nach dem Verbinden Licht an.
+      // Like the original app: light on after connecting.
       try {
         await setLed(100);
       } catch (e) {
@@ -148,31 +95,32 @@ class CameraClient {
       _infoTimer = Timer.periodic(_infoInterval, (_) => _pollInfo());
     } catch (e) {
       await _teardown();
-      _setStatus(_status.copyWith(error: e is CameraException ? e.message : '$e'));
+      setStatus(status.copyWith(error: e is CameraException ? e.message : '$e'));
       rethrow;
     }
   }
 
+  @override
   Future<void> disconnect() => _teardown();
 
+  @override
   Future<void> dispose() async {
     await _teardown();
-    await _frames.close();
-    await _sensors.close();
-    await _statusCtrl.close();
+    await closeControllers();
   }
 
+  @override
   Future<void> setLed(int level) async {
     final res = await _request(config.cmdPort, MsgType.led, ledSetPayload(level));
     if (res.errCode != 0) throw CameraException('LED: Fehlercode ${res.errCode}');
-    _setStatus(_status.copyWith(led: level.clamp(0, 100)));
-    // Anzeige nach dem tatsächlichen Zustand der Kamera richten.
+    setStatus(status.copyWith(led: level.clamp(0, 100)));
+    // Align the display with the camera's actual state.
     try {
       await _readLed();
     } catch (_) {}
   }
 
-  // --- intern ---------------------------------------------------------------
+  // --- internal -------------------------------------------------------------
 
   Future<void> _teardown() async {
     _watchdog?.cancel();
@@ -192,18 +140,19 @@ class CameraClient {
       p.timer.cancel();
       if (!p.completer.isCompleted) p.completer.completeError(const CameraException('getrennt'));
     }
-    _setStatus(_status.copyWith(connected: false, fps: 0));
+    resetFps();
+    setStatus(status.copyWith(connected: false));
   }
 
   Future<String> _updateInfo() async {
     final res = await _request(config.cmdPort, MsgType.getDeviceInfo);
     final info = parseDeviceInfo(res.data);
     if (info == null) throw CameraException('GetDeviceInfo: unerwartete Antwort (${res.data.length} Byte)');
-    _setStatus(_status.copyWith(
+    setStatus(status.copyWith(
       battery: info.battery,
       charging: info.charging,
       details: {
-        ..._status.details,
+        ...status.details,
         'Hersteller': info.vendor,
         'Modell': info.product,
         'Firmware': info.firmware,
@@ -217,7 +166,7 @@ class CameraClient {
   Future<void> _readLed() async {
     final res = await _request(config.cmdPort, MsgType.led, ledQueryPayload());
     final level = parseLedStatus(res.data);
-    if (level != null) _setStatus(_status.copyWith(led: level));
+    if (level != null) setStatus(status.copyWith(led: level));
   }
 
   Future<void> _pollInfo() async {
@@ -228,26 +177,40 @@ class CameraClient {
         await _readLed();
       } catch (_) {}
       _infoFailures = 0;
-      if (_status.error == lost) _setStatus(_status.copyWith(clearError: true));
+      if (status.error == lost) setStatus(status.copyWith(clearError: true));
     } catch (_) {
-      if (++_infoFailures >= 3) _setStatus(_status.copyWith(error: lost));
+      if (++_infoFailures >= 3) setStatus(status.copyWith(error: lost));
     }
   }
 
   Future<void> _openStreamSockets() async {
-    for (final port in config.streamPorts) {
+    // Retry the preferred port first over the time window, so a port that is
+    // still busy does not divert the video stream.
+    for (var i = 0; i < config.streamPorts.length; i++) {
+      final port = config.streamPorts[i];
+      final sock = await _bindStreamPort(port, isPreferred: i == 0);
+      if (sock != null) return; // the first successfully bound port is advertised
+    }
+    throw CameraException('Keiner der Bild-Ports ${config.streamPorts.join('/')} ist frei');
+  }
+
+  Future<RawDatagramSocket?> _bindStreamPort(int port, {required bool isPreferred}) async {
+    final deadline = DateTime.now().add(isPreferred ? const Duration(seconds: 3) : Duration.zero);
+    for (;;) {
       try {
         final s = await RawDatagramSocket.bind(InternetAddress.anyIPv4, port);
         s.listen((e) {
           if (e == RawSocketEvent.read) _onStreamData(s, port);
         });
         _streamSocks.add(s);
+        return s;
       } catch (e) {
-        log('Bild-Port $port nicht nutzbar: $e');
+        if (DateTime.now().isAfter(deadline)) {
+          log('Bild-Port $port nicht nutzbar: $e');
+          return null;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 250));
       }
-    }
-    if (_streamSocks.isEmpty) {
-      throw CameraException('Keiner der Bild-Ports ${config.streamPorts.join('/')} ist frei');
     }
   }
 
@@ -255,8 +218,8 @@ class CameraClient {
     try {
       await _sendOpenVideo();
     } catch (e) {
-      // Ältere Firmware kennt die Port-Nutzlast evtl. nicht → ohne versuchen.
-      // Hat der Port-Modus schon Bilder geliefert, ist es nur ein Ausfall.
+      // Older firmware may not know the port payload -> try without it.
+      // If the port mode already delivered frames, it is just a drop-out.
       if (!_usePortPayload || _everReceived) rethrow;
       log('OpenVideo mit Port fehlgeschlagen ($e) – versuche ohne Nutzlast');
       _usePortPayload = false;
@@ -277,15 +240,13 @@ class CameraClient {
   }
 
   void _checkStall() {
-    _frameTimes.removeWhere((t) => DateTime.now().difference(t) > const Duration(seconds: 3));
-    final fps = (_frameTimes.length / 3 * 10).round() / 10;
-    if (fps != _status.fps) _setStatus(_status.copyWith(fps: fps));
+    refreshFps();
 
-    if (!_status.connected || _restartPending || DateTime.now().difference(_lastData) < _stall) return;
+    if (!status.connected || _restartPending || DateTime.now().difference(_lastData) < _stall) return;
     if (!_everReceived && _usePortPayload) _usePortPayload = false;
     _stallError = true;
     final msg = _everReceived ? 'Bildstrom unterbrochen – starte neu' : 'Keine Bilddaten – versuche anderen Startmodus';
-    _setStatus(_status.copyWith(error: msg));
+    setStatus(status.copyWith(error: msg));
     log(msg);
     _lastData = DateTime.now();
     _restartPending = true;
@@ -300,27 +261,25 @@ class CameraClient {
       if (!_everReceived) {
         _everReceived = true;
         log('Erste Bilddaten auf Port $port');
-        _setStatus(_status.copyWith(details: {
-          ..._status.details,
+        setStatus(status.copyWith(details: {
+          ...status.details,
           'Empfangsport': '$port',
           'Startmodus': _usePortPayload ? 'port' : 'plain',
         }));
       }
       if (_stallError) {
         _stallError = false;
-        _setStatus(_status.copyWith(clearError: true));
+        setStatus(status.copyWith(clearError: true));
       }
       for (final chunk in parseChunks(d.data)) {
         final frame = _assembler.push(chunk);
         if (frame == null) continue;
-        lastFrame = frame;
-        _frameTimes.add(DateTime.now());
         final res = '${frame.width}×${frame.height}';
-        if (_status.details['Auflösung'] != res) {
-          _setStatus(_status.copyWith(details: {..._status.details, 'Auflösung': res}));
+        if (status.details['Auflösung'] != res) {
+          setStatus(status.copyWith(details: {...status.details, 'Auflösung': res}));
         }
-        _frames.add(frame);
-        _sensors.add(_smoother.push(frame.accel, frame.flags));
+        emitFrame(frame);
+        emitSensor(_smoother.push(frame.accel, frame.flags));
       }
     }
   }
@@ -340,8 +299,8 @@ class CameraClient {
     }
   }
 
-  /// Anfrage/Antwort, serialisiert – die Kamera beantwortet eine nach der
-  /// anderen; zugeordnet über Absenderport und Nachrichtentyp.
+  /// Request/response, serialized - the camera answers one request after the
+  /// other; matched via source port and message type.
   Future<Message> _request(int port, int type, [List<int> data = const [], int attempts = 3]) {
     Future<Message> run() async {
       Object lastErr = const CameraException('keine Antwort');
@@ -382,13 +341,6 @@ class _PendingRequest {
   final int type;
   final Completer<Message> completer;
   final Timer timer;
-}
-
-class CameraException implements Exception {
-  const CameraException(this.message);
-  final String message;
-  @override
-  String toString() => message;
 }
 
 void _noLog(String _) {}

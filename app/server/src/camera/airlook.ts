@@ -8,10 +8,6 @@
 import dgram from "node:dgram";
 import net from "node:net";
 import {
-  CONTROL_PORT,
-  DISCOVERY_PORT,
-  VIDEO_PORT,
-  MessageType,
   parseDiscoveryResponse,
   parseStatusResponse,
   parseVideoPacket,
@@ -19,19 +15,15 @@ import {
   encodeDiscoveryRequest,
   encodeStartStreamingCommand,
   encodeStatusRequest,
+  DISCOVERY_PORT,
+  VIDEO_PORT,
+  CONTROL_PORT,
   type DeviceInfo,
 } from "./airlook-protocol.ts";
-import { CameraDriver } from "./types.ts";
-
-export interface AirlookOptions {
-  ip: string;
-  cmdPort?: number;
-  videoPort?: number;
-  controlPort?: number;
-  log: (msg: string) => void;
-}
+import { CameraDriver, type DriverConfig, type ProbeResult } from "./types.js";
 
 const REQUEST_TIMEOUT_MS = 3000;
+const PROBE_TIMEOUT_MS = 1500;
 const VIDEO_HEARTBEAT_MS = 600;
 const STATUS_POLL_MS = 1800;
 
@@ -54,25 +46,26 @@ export class AirlookDriver extends CameraDriver {
   private statusTimer: NodeJS.Timeout | null = null;
   private deviceInfo: DeviceInfo | null = null;
 
-  constructor(private readonly opts: AirlookOptions) {
-    super();
+  constructor(
+    config: DriverConfig,
+    private log: (msg: string) => void,
+  ) {
+    super(config);
   }
 
-  async connect(): Promise<void> {
-    if (this.connected) {
-      return;
-    }
-
+  async init(): Promise<boolean> {
     this.error = null;
-    this.cmdSock = dgram.createSocket({ type: "udp4", reuseAddr: true });
-    this.videoSock = dgram.createSocket({ type: "udp4", reuseAddr: true });
 
+    this.cmdSock = dgram.createSocket({ type: "udp4", reuseAddr: true });
     this.cmdSock.on("error", (err: Error) => {
       console.error("[AIRLOOK] command socket error:", err.message);
+      return false;
     });
 
+    this.videoSock = dgram.createSocket({ type: "udp4", reuseAddr: true });
     this.videoSock.on("error", (err: Error) => {
       console.error("[AIRLOOK] video socket error:", err.message);
+      return false;
     });
 
     this.videoSock.on("message", (buf) => this.onVideoData(buf));
@@ -80,9 +73,46 @@ export class AirlookDriver extends CameraDriver {
     this.cmdSock.bind(0);
     this.videoSock.bind(0);
 
+    return true;
+  }
+
+  async destroy(): Promise<void> {
+    return;
+  }
+
+  async probe(): Promise<ProbeResult> {
+    try {
+      const req = encodeDiscoveryRequest();
+      const res = await this.probeRequest(
+        this.config.cameraCmdPort,
+        req,
+        PROBE_TIMEOUT_MS,
+      );
+      const parsed = parseDiscoveryResponse(res);
+
+      if (!parsed) {
+        return { compatible: false, reason: "Invalid discovery response" };
+      }
+
+      console.log(`[AIRLOOK] probe success`);
+      return { compatible: true };
+    } catch (err) {
+      console.log(`[AIRLOOK] probe failed: ${(err as Error).message}`);
+      return {
+        compatible: false,
+        reason: (err as Error).message,
+      };
+    }
+  }
+
+  async connect(): Promise<void> {
+    if (this.connected) {
+      return;
+    }
+
     try {
       await this.discover();
-      this.opts.log(`Camera: ${this.deviceInfo?.model ?? "unknown"}`);
+      this.log(`Camera: ${this.deviceInfo?.model ?? "unknown"}`);
 
       this.connected = true;
       this.connectTcp();
@@ -122,12 +152,12 @@ export class AirlookDriver extends CameraDriver {
 
   private async discover(): Promise<void> {
     const req = encodeDiscoveryRequest();
-    const res = await this.sendRequest(this.opts.cmdPort ?? DISCOVERY_PORT, req);
+    const res = await this.sendRequest(this.config.cameraCmdPort, req);
     const parsed = parseDiscoveryResponse(res);
 
     if (!parsed) {
       throw new Error(
-        `Camera did not respond (${this.opts.ip}:${this.opts.cmdPort ?? DISCOVERY_PORT}).`,
+        `Camera did not respond (${this.config.cameraIp}:${this.config.cameraCmdPort}).`,
       );
     }
 
@@ -151,7 +181,7 @@ export class AirlookDriver extends CameraDriver {
   private async pollStatus(): Promise<void> {
     try {
       const req = encodeStatusRequest();
-      const res = await this.sendStatusRequest(this.opts.cmdPort ?? DISCOVERY_PORT, req);
+      const res = await this.sendStatusRequest(this.config.cameraCmdPort, req);
       const status = parseStatusResponse(res);
 
       if (!status) {
@@ -171,9 +201,9 @@ export class AirlookDriver extends CameraDriver {
   }
 
   private startVideo(): void {
-    const port = this.opts.videoPort ?? VIDEO_PORT;
+    const port = this.config.cameraVideoPort ?? VIDEO_PORT;
     const req = encodeStartStreamingCommand();
-    this.videoSock?.send(req, port, this.opts.ip, (err) => {
+    this.videoSock?.send(req, port, this.config.cameraIp, (err) => {
       if (err) {
         console.error("[AIRLOOK] start video send error:", err.message);
       }
@@ -185,9 +215,9 @@ export class AirlookDriver extends CameraDriver {
       return;
     }
 
-    const port = this.opts.videoPort ?? VIDEO_PORT;
+    const port = this.config.cameraVideoPort ?? VIDEO_PORT;
     const req = encodeStartStreamingCommand();
-    this.videoSock?.send(req, port, this.opts.ip, (err) => {
+    this.videoSock?.send(req, port, this.config.cameraIp, (err) => {
       if (err) {
         console.error("[AIRLOOK] heartbeat send error:", err.message);
       }
@@ -195,7 +225,7 @@ export class AirlookDriver extends CameraDriver {
   }
 
   private connectTcp(): void {
-    const controlPort = this.opts.controlPort ?? CONTROL_PORT;
+    const controlPort = CONTROL_PORT;
     let attempts = 0;
 
     const tryConnect = (): void => {
@@ -203,17 +233,17 @@ export class AirlookDriver extends CameraDriver {
         return;
       }
 
-      const sock = net.createConnection({ host: this.opts.ip, port: controlPort });
+      const sock = net.createConnection({ host: this.config.cameraIp, port: controlPort });
       sock.setTimeout(2000);
 
       sock.once("connect", () => {
         this.tcpSock = sock;
-        this.opts.log(`TCP connected to port ${controlPort}`);
-        console.log(`[AIRLOOK] tcp connected to ${this.opts.ip}:${controlPort}`);
+        this.log(`TCP connected to port ${controlPort}`);
+        console.log(`[AIRLOOK] tcp connected to ${this.config.cameraIp}:${controlPort}`);
       });
 
       sock.on("error", () => {
-        console.warn(`[AIRLOOK] TCP connection failed to ${this.opts.ip}:${controlPort}`);
+        console.warn(`[AIRLOOK] TCP connection failed to ${this.config.cameraIp}:${controlPort}`);
         sock.destroy();
         attempts += 1;
         if (this.connected) {
@@ -246,11 +276,15 @@ export class AirlookDriver extends CameraDriver {
     }
   }
 
-  private sendRequest(port: number, data: Buffer, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Buffer> {
+  private sendRequest(
+    port: number,
+    data: Buffer,
+    timeoutMs = REQUEST_TIMEOUT_MS,
+  ): Promise<Buffer> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         cleanup();
-        reject(new Error(`Request timed out while talking to ${this.opts.ip}:${port}`));
+        reject(new Error(`Request timed out while talking to ${this.config.cameraIp}:${port}`));
       }, timeoutMs);
 
       const cleanup = () => {
@@ -259,17 +293,19 @@ export class AirlookDriver extends CameraDriver {
       };
 
       const onMessage = (buf: Buffer, rinfo: dgram.RemoteInfo) => {
-        if (rinfo.address !== this.opts.ip) {
+        if (rinfo.address !== this.config.cameraIp) {
           return;
         }
 
-        console.log(`[AIRLOOK RX] request response from ${rinfo.address}:${rinfo.port} -> ${buf.length} bytes`);
+        console.log(
+          `[AIRLOOK RX] request response from ${rinfo.address}:${rinfo.port} -> ${buf.length} bytes`,
+        );
         cleanup();
         resolve(buf);
       };
 
       this.cmdSock?.once("message", onMessage);
-      this.cmdSock?.send(data, port, this.opts.ip, (err) => {
+      this.cmdSock?.send(data, port, this.config.cameraIp, (err) => {
         if (err) {
           cleanup();
           console.error("[AIRLOOK] UDP send failed:", err.message);
@@ -279,20 +315,26 @@ export class AirlookDriver extends CameraDriver {
     });
   }
 
-  private sendStatusRequest(port: number, data: Buffer, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Buffer> {
+  private sendStatusRequest(
+    port: number,
+    data: Buffer,
+    timeoutMs = REQUEST_TIMEOUT_MS,
+  ): Promise<Buffer> {
     return new Promise((resolve, reject) => {
       const sock = dgram.createSocket({ type: "udp4" });
       const timer = setTimeout(() => {
         sock.close();
-        reject(new Error(`Status request timed out while talking to ${this.opts.ip}:${port}`));
+        reject(new Error(`Status request timed out while talking to ${this.config.cameraIp}:${port}`));
       }, timeoutMs);
 
       const onMessage = (buf: Buffer, rinfo: dgram.RemoteInfo) => {
-        if (rinfo.address !== this.opts.ip) {
+        if (rinfo.address !== this.config.cameraIp) {
           return;
         }
 
-        console.log(`[AIRLOOK RX] status response from ${rinfo.address}:${rinfo.port} -> ${buf.length} bytes`);
+        console.log(
+          `[AIRLOOK RX] status response from ${rinfo.address}:${rinfo.port} -> ${buf.length} bytes`,
+        );
         clearTimeout(timer);
         sock.close();
         resolve(buf);
@@ -306,11 +348,50 @@ export class AirlookDriver extends CameraDriver {
         reject(err);
       });
 
-      sock.send(data, port, this.opts.ip, (err) => {
+      sock.send(data, port, this.config.cameraIp, (err) => {
         if (err) {
           clearTimeout(timer);
           sock.close();
           console.error("[AIRLOOK] status send failed:", err.message);
+          reject(err);
+        }
+      });
+    });
+  }
+
+  private probeRequest(
+    port: number,
+    data: Buffer,
+    timeoutMs: number,
+  ): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const sock = dgram.createSocket({ type: "udp4" });
+      const timer = setTimeout(() => {
+        sock.close();
+        reject(new Error("probe timeout"));
+      }, timeoutMs);
+
+      const onMessage = (buf: Buffer, rinfo: dgram.RemoteInfo) => {
+        if (rinfo.address !== this.config.cameraIp) {
+          return;
+        }
+
+        clearTimeout(timer);
+        sock.close();
+        resolve(buf);
+      };
+
+      sock.once("message", onMessage);
+      sock.once("error", () => {
+        clearTimeout(timer);
+        sock.close();
+        reject(new Error("socket error"));
+      });
+
+      sock.send(data, port, this.config.cameraIp, (err) => {
+        if (err) {
+          clearTimeout(timer);
+          sock.close();
           reject(err);
         }
       });

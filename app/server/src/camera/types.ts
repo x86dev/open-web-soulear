@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import type { SensorReading } from "./suear-protocol.js";
+import type { SensorReading } from "./suear-protocol.ts";
 
 export type { SensorReading };
 
@@ -35,6 +35,27 @@ export interface CameraDriverEvents {
 }
 
 /**
+ * Probe result returned by a driver's probe method.
+ * Indicates whether the driver can handle the camera at the configured IP.
+ */
+export interface ProbeResult {
+  /** True if the driver successfully detected and can communicate with its device. */
+  compatible: boolean;
+  /** Optional reason if probing failed. */
+  reason?: string;
+}
+
+/**
+ * Driver configuration that can be read from environment and overridden by probing.
+ */
+export interface DriverConfig {
+  cameraIp: string;
+  cameraCmdPort: number;
+  cameraVideoPort: number;
+  cameraStreamPorts?: number[];
+}
+
+/**
  * Gemeinsame Basis aller Treiber. Ein Treiber liefert JPEG-Frames per
  * `frame`-Event; Bildrate und letzter Frame werden hier zentral gezählt.
  */
@@ -47,6 +68,7 @@ export abstract class CameraDriver extends EventEmitter<CameraDriverEvents> {
   protected battery: number | null = null;
   protected led: number | null = null;
   protected details: Record<string, string> = {};
+  protected config: DriverConfig;
 
   private frameCount = 0;
   private lastFrame: Buffer | null = null;
@@ -54,8 +76,24 @@ export abstract class CameraDriver extends EventEmitter<CameraDriverEvents> {
   private frameTimes: number[] = [];
   private lastSensor: SensorReading | null = null;
 
+  constructor(defaultConfig: DriverConfig) {
+    super();
+    this.config = defaultConfig;
+  }
+
+  abstract init(): Promise<boolean>;
+  abstract destroy(): Promise<void>;
+
   abstract connect(): Promise<void>;
   abstract disconnect(): Promise<void>;
+
+  /**
+   * Probe the camera to determine if this driver can handle it.
+   * Implementations should perform a quick, non-blocking discovery check.
+   * Return immediately if the device is incompatible or unreachable.
+   * Can optionally override driver config based on probing results.
+   */
+  abstract probe(): Promise<ProbeResult>;
 
   /** LED-Helligkeit 0–100. Nur wenn `capabilities.led`. */
   async setLed(_level: number): Promise<void> {

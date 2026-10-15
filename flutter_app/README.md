@@ -10,7 +10,9 @@ Bildstabilisierung, Galerie, Geräteinfo.
 | Teil | Status |
 |---|---|
 | Protokoll in Dart (`lib/src/protocol.dart`) | fertig, Unit-Tests |
-| Kamera-Client (`lib/src/camera_client.dart`) | fertig, gegen die simulierte Kamera getestet |
+| Soulear-Treiber (`lib/src/soulear_client.dart`) | fertig, gegen die simulierte Kamera getestet |
+| AIR-Look-Treiber (`lib/src/airlook_client.dart`) | nach `app/server/src/camera/airlook.ts` umgesetzt, Unit-Tests für das Protokoll |
+| Auto-Treiber (`lib/src/auto_client.dart`) | probiert Soulear → AIR-Look; Standard |
 | Oberfläche Handy/Tablet, hell/dunkel | fertig, Layout-Tests ohne Überläufe |
 | Android-Build | APK baut (Release arm64: ~18 MB) |
 | Test mit echter Kamera | **läuft** – Nothing Phone (2a), Android 16, mit Kamera `BK7231U-XRH-FBPRO`: Livebild, LED, Stabilisierung, Sensorwerte |
@@ -36,8 +38,9 @@ Handy ausreichend, nicht für den Play Store.
 
 1. Kamera einschalten, **Handy mit dem WLAN der Kamera verbinden**
    (`Soulear-…`). Android meldet „kein Internet“ – verbunden bleiben.
-2. App öffnen – sie verbindet sich automatisch mit `192.168.1.1`
-   (änderbar im Tab „Gerät“).
+2. App öffnen – sie verbindet sich automatisch (Standard: Kamera-Typ „auto“,
+   IP `192.168.1.1`). Im Tab **Gerät** lässt sich der Kameratyp
+   (`auto`/`soulear`/`airlook`) und die IP ändern.
 3. Fotos landen in der App **und** in der Galerie (Album „Soulear lokal“).
 
 **Warum die App sich ans WLAN bindet:** Weil das Kamera-WLAN kein Internet
@@ -50,9 +53,10 @@ Original-App).
 
 ```bash
 flutter test                                  # Protokoll- und Layout-Tests
-(cd ../app && npm run fake-camera)            # simulierte Kamera (Terminal 1)
-dart run tool/probe.dart 127.0.0.1 5          # Dart-Client dagegen testen (Terminal 2)
-dart run tool/probe.dart                      # … oder gegen die echte Kamera (Mac im Kamera-WLAN)
+(cd ../app && npm run fake-camera)            # simulierte Soulear-Kamera (Terminal 1)
+dart run tool/probe.dart soulear 127.0.0.1 5  # Dart-Client dagegen testen (Terminal 2)
+dart run tool/probe.dart auto                 # … oder echte Kamera, Treiber raten
+dart run tool/probe.dart                      # Standard: auto, 192.168.1.1
 ```
 
 `tool/probe.dart` verbindet, zählt Bilder, zeigt Sensorwerte und prüft die
@@ -64,8 +68,12 @@ LED – dasselbe, was die App tut, nur ohne Oberfläche.
 lib/
 ├── main.dart                 – App, Theme (hell/dunkel nach System)
 ├── src/
-│   ├── protocol.dart         – Nachrichten, Chunks, Frame-Assembler, Sensor-Glättung (reines Dart)
-│   ├── camera_client.dart    – UDP-Client (dart:io): Verbindung, OpenVideo, Watchdog, LED, Status
+│   ├── protocol.dart         – Suear-Protokoll: Nachrichten, Chunks, Frame-Assembler (reines Dart)
+│   ├── airlook_protocol.dart – AIR-Look-Protokoll: Discovery/Status, Videopakete, Assembler
+│   ├── camera.dart           – gemeinsame Treiber-Schnittstelle + Status/Capabilities
+│   ├── soulear_client.dart   – Soulear/Suear-Treiber (dart:io)
+│   ├── airlook_client.dart   – AIR-Look-Treiber (dart:io)
+│   ├── auto_client.dart      – Auto-Treiber: probiert soulear → airlook (Standard)
 │   └── app_controller.dart   – Zustand, Einstellungen, Fotos, WLAN-Bindung
 └── ui/
     ├── home_page.dart        – Layout (breit: Seitenleiste; Handy: untereinander), Bedienleiste

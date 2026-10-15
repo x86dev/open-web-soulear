@@ -15,49 +15,60 @@ class SensorTab extends StatelessWidget {
   Widget build(BuildContext context) {
     final s = controller.stabilize;
     final text = Theme.of(context).textTheme;
-    return ListView(padding: const EdgeInsets.all(16), children: [
-      ValueListenableBuilder(
-        valueListenable: controller.sensor,
-        builder: (context, r, _) {
-          if (r == null) return Text('Warte auf Sensordaten …', style: text.bodyMedium);
-          if (!r.available) return Text('Die Kamera liefert keine Lagewerte (alle 0).', style: text.bodyMedium);
-          return Row(children: [
-            SizedBox.square(dimension: 96, child: CustomPaint(painter: _DialPainter(r, Theme.of(context).colorScheme))),
-            const SizedBox(width: 16),
-            Expanded(
-              child: Wrap(spacing: 16, runSpacing: 12, children: [
-                _Value('Drehung', '${r.roll.toStringAsFixed(1)}°', big: true),
-                _Value('Neigung', '${r.pitch.toStringAsFixed(1)}°', big: true),
-                _Value('Roh x / y / z', '${r.x} / ${r.y} / ${r.z}', mono: true),
-                _Value('Header-Byte 0 / 5', '${_hex(r.flags.$1)} / ${_hex(r.flags.$2)}', mono: true),
-              ]),
+    return ValueListenableBuilder(
+      valueListenable: controller.status,
+      builder: (context, status, _) {
+        final hasSensors = status.capabilities.sensors;
+        return ListView(padding: const EdgeInsets.all(16), children: [
+          if (!hasSensors && status.connected)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 16),
+              child: Text('Dieser Kamera-Typ liefert keine Lagewerte.', style: text.bodyMedium),
             ),
-          ]);
-        },
-      ),
-      const SizedBox(height: 16),
-      Text('STABILISIERUNG', style: text.labelSmall),
-      SwitchListTile(
-        contentPadding: EdgeInsets.zero,
-        title: const Text('Bild stabilisieren'),
-        value: s.enabled,
-        onChanged: (v) => controller.setStabilize(s.copyWith(enabled: v)),
-      ),
-      SwitchListTile(
-        contentPadding: EdgeInsets.zero,
-        title: const Text('Richtung umkehren'),
-        value: s.invert,
-        onChanged: s.enabled ? (v) => controller.setStabilize(s.copyWith(invert: v)) : null,
-      ),
-      Row(children: [
-        const Expanded(child: Text('Versatz')),
-        DropdownButton<int>(
-          value: s.offset,
-          onChanged: s.enabled ? (v) => controller.setStabilize(s.copyWith(offset: v)) : null,
-          items: [for (final o in [0, 90, 180, 270]) DropdownMenuItem(value: o, child: Text('$o°'))],
-        ),
-      ]),
-    ]);
+          ValueListenableBuilder(
+            valueListenable: controller.sensor,
+            builder: (context, r, _) {
+              if (r == null) return Text('Warte auf Sensordaten …', style: text.bodyMedium);
+              if (!r.available) return Text('Die Kamera liefert keine Lagewerte (alle 0).', style: text.bodyMedium);
+              return Row(children: [
+                SizedBox.square(dimension: 96, child: CustomPaint(painter: _DialPainter(r, Theme.of(context).colorScheme))),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Wrap(spacing: 16, runSpacing: 12, children: [
+                    _Value('Drehung', '${r.roll.toStringAsFixed(1)}°', big: true),
+                    _Value('Neigung', '${r.pitch.toStringAsFixed(1)}°', big: true),
+                    _Value('Roh x / y / z', '${r.x} / ${r.y} / ${r.z}', mono: true),
+                    _Value('Header-Byte 0 / 5', '${_hex(r.flags.$1)} / ${_hex(r.flags.$2)}', mono: true),
+                  ]),
+                ),
+              ]);
+            },
+          ),
+          const SizedBox(height: 16),
+          Text('STABILISIERUNG', style: text.labelSmall),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Bild stabilisieren'),
+            value: s.enabled,
+            onChanged: hasSensors ? (v) => controller.setStabilize(s.copyWith(enabled: v)) : null,
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Richtung umkehren'),
+            value: s.invert,
+            onChanged: (hasSensors && s.enabled) ? (v) => controller.setStabilize(s.copyWith(invert: v)) : null,
+          ),
+          Row(children: [
+            const Expanded(child: Text('Versatz')),
+            DropdownButton<int>(
+              value: s.offset,
+              onChanged: (hasSensors && s.enabled) ? (v) => controller.setStabilize(s.copyWith(offset: v)) : null,
+              items: [for (final o in [0, 90, 180, 270]) DropdownMenuItem(value: o, child: Text('$o°'))],
+            ),
+          ]),
+        ]);
+      },
+    );
   }
 }
 
