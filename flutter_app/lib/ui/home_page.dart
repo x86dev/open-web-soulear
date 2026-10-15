@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../src/app_controller.dart';
 import '../src/camera.dart';
 import 'device_tab.dart';
+import 'fullscreen_view.dart';
 import 'live_view.dart';
 import 'photos_tab.dart';
 import 'sensor_tab.dart';
@@ -128,7 +129,10 @@ class _LiveCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final view = LiveView(controller: controller);
+    final view = LiveView(
+      controller: controller,
+      onTap: () => FullscreenView.open(context, controller),
+    );
     return Card.outlined(
       clipBehavior: Clip.antiAlias,
       margin: EdgeInsets.zero,

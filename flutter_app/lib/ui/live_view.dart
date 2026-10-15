@@ -6,13 +6,23 @@ import '../src/app_controller.dart';
 
 /// Livebild. Mit Stabilisierung rund zugeschnitten und gegen die Drehung der
 /// Kamera gedreht (weich animiert, 120 ms).
+///
+/// [fullscreen] füllt den verfügbaren Platz vollständig aus (randlos, ohne
+/// Außenabstand). Ist [onTap] gesetzt, öffnet ein Tippen auf das Bild das
+/// Vollbild.
 class LiveView extends StatelessWidget {
-  const LiveView({super.key, required this.controller});
+  const LiveView({super.key, required this.controller, this.fullscreen = false, this.onTap});
   final AppController controller;
+
+  /// Großansicht: Bild ohne Rand, Zuschnitt füllt den ganzen Bereich.
+  final bool fullscreen;
+
+  /// Wird beim Tippen auf das Bild aufgerufen (öffnet das Vollbild).
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
-    return ColoredBox(
+    final content = ColoredBox(
       color: Colors.black,
       child: ValueListenableBuilder(
         valueListenable: controller.frame,
@@ -32,7 +42,8 @@ class LiveView extends StatelessWidget {
             builder: (context, rotation, _) {
               if (rotation == null) return Center(child: image);
               return LayoutBuilder(builder: (context, c) {
-                final size = math.min(c.maxWidth, c.maxHeight) - 16;
+                // Im Vollbild den ganzen Bereich nutzen, sonst etwas Rand lassen.
+                final size = math.min(c.maxWidth, c.maxHeight) - (fullscreen ? 0 : 16);
                 return Center(
                   child: ClipOval(
                     child: SizedBox.square(
@@ -50,6 +61,13 @@ class LiveView extends StatelessWidget {
           );
         },
       ),
+    );
+
+    if (onTap == null) return content;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: content,
     );
   }
 }
