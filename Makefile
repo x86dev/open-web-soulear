@@ -7,9 +7,9 @@
 #   make web               Build the web app (Node/TS backend + React frontend)
 #   make clean             Remove build artifacts of the app and the Flutter app
 #
-# The Android targets run in a Podman container (image gmeligio/flutter-android)
-# like build.sh, because a local Flutter SDK may not be installed. The web app
-# needs Node.js (>= 22) locally; `adb-install` needs adb.
+# The Android targets run in a Podman container (image gmeligio/flutter-android),
+# because a local Flutter SDK may not be installed. The web app needs Node.js
+# (>= 22) locally; `adb-install` needs adb.
 
 # --- Configuration ----------------------------------------------------------
 
@@ -21,11 +21,9 @@ CONTAINER_ENGINE ?= podman
 # For `adb-install`: which ABI of the release APK to install.
 ABI ?= arm64-v8a
 
-# Podman invocation for a Flutter command in the flutter_app directory.
-# No -it: meant for automation/CI. `,Z`/`,U` set the SELinux context and the
-# ownership so files created in the container belong to the host user.
 CONTAINER_RUN = $(CONTAINER_ENGINE) run --rm \
-	-v $(CURDIR)/flutter_app:/app:U,Z \
+	--userns=keep-id:uid=1001,gid=1001 \
+	-v $(CURDIR)/flutter_app:/app:Z \
 	-w /app \
 	$(FLUTTER_IMG):$(FLUTTER_SDK)
 
@@ -40,7 +38,7 @@ all: android-release
 
 # --- Android (Flutter in the container) -------------------------------------
 
-## Build the release APK for arm64 (like build.sh).
+## Build the release APK for arm64.
 android:
 android-release:
 	$(CONTAINER_RUN) flutter build apk --release --split-per-abi --target-platform android-arm64

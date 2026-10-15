@@ -4,9 +4,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:soulear_local/src/camera.dart';
 import 'package:soulear_local/src/protocol.dart';
 
-/// Minimaler Treiber, nur um die zentrale Bildraten-Logik der Basisklasse zu
-/// prüfen. `fps` gehört zur Basisklasse und wird aus den Frames abgeleitet –
-/// Treiber setzen es nicht selbst.
+/// Minimal driver, only to test the central frame-rate logic of the base class.
+/// `fps` belongs to the base class and is derived from the frames - drivers do
+/// not set it themselves.
 class _FakeDriver extends BaseCameraDriver {
   @override
   String get name => 'fake';
@@ -29,12 +29,12 @@ class _FakeDriver extends BaseCameraDriver {
 }
 
 void main() {
-  test('fps gehört zur Basisklasse und folgt den Frames', () async {
+  test('fps belongs to the base class and follows the frames', () async {
     final d = _FakeDriver();
     await d.connect();
     expect(d.fps, 0);
 
-    // 30 Bilder kurz hintereinander -> über das 3-s-Fenster ~10 fps.
+    // 30 frames in quick succession -> about 10 fps over the 3 s window.
     for (var i = 0; i < 30; i++) {
       d.feedFrame();
     }
@@ -43,7 +43,7 @@ void main() {
     expect(d.status.fps, d.fps);
   });
 
-  test('resetFps setzt die Bildrate auf 0 und disconnect räumt auf', () async {
+  test('resetFps zeroes the frame rate and disconnect cleans up', () async {
     final d = _FakeDriver();
     await d.connect();
     for (var i = 0; i < 10; i++) {

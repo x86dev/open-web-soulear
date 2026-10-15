@@ -1,4 +1,4 @@
-package io.github.soulearlocal.soulear_local
+package io.github.openearcam.openearcam
 
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -7,10 +7,10 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 /**
- * Das Kamera-WLAN hat kein Internet – Android schickt Verbindungen dann über
- * die mobilen Daten, und die Kamera (192.168.1.1) ist nicht erreichbar.
- * Deshalb wird die ganze App vor dem Verbinden an das WLAN gebunden
- * (so macht es auch die Original-App, WifiCallBackFuc.bindSocket).
+ * The camera Wi-Fi has no internet - Android would then route connections over
+ * mobile data, and the camera (192.168.1.1) would be unreachable. That is why
+ * the whole app is bound to the Wi-Fi before connecting (the original app does
+ * the same, WifiCallBackFuc.bindSocket).
  */
 class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
