@@ -96,11 +96,57 @@ export interface StatusReading {
 export interface VideoPacketHeader {
   magic: number;
   type: number;
-  streamId: number;
+  /** Frame counter, incremented once per JPEG. */
   frameId: number;
-  seqNum: number;
+  /** Packet index within the current frame (0-based). */
+  packetIndex: number;
+  /** Bytes of JPEG carried by this packet. */
   payloadSize: number;
-  timestamp: number;
+  /**
+   * Packed accelerometer reading, identical in every chunk of one frame.
+   * The camera samples it once per frame, so it must be carried along with
+   * the frame data. Decode with [decodeAccelerometer].
+   */
+  accelRaw: number;
+}
+
+/** Raw accelerometer axes as packed into the chunk header. */
+export interface AccelRaw {
+  /** 12-bit value (0..4095). */
+  x: number;
+  /** 10-bit value (0..1023). */
+  y: number;
+  /** 10-bit value (0..1023). */
+  z: number;
+  /** The undecoded 32-bit word, for logging and debugging. */
+  raw: number;
+}
+
+/**
+ * Decodes the packed accelerometer field from a video chunk header.
+ *
+ * The 32-bit little-endian word at offset [16:20] packs three axes, matching
+ * the official app's StreamSelf.doExecuteMJPEG():
+ *
+ * ```
+ * bit 31           20 19         10 9            0
+ *  ┌───────────────┐┌─────────────┐┌─────────────┐
+ *  │   X (12 bit)  ││  Y (10 bit) ││  Z (10 bit) │
+ *  └───────────────┘└─────────────┘└─────────────┘
+ * ```
+ *
+ * The values are raw ADC counts, not gs.
+ *
+ * Source: https://github.com/tiktock/unofficial-airlook-web
+ * (analysis/video-stream.md)
+ */
+export function decodeAccelerometer(raw: number): AccelRaw {
+  return {
+    x: (raw >>> 20) & 0xfff,
+    y: (raw >>> 10) & 0x3ff,
+    z: raw & 0x3ff,
+    raw: raw >>> 0,
+  };
 }
 
 function formatHex(buf: Buffer): string {
@@ -337,26 +383,25 @@ export function parseVideoPacketHeader(buf: Buffer): VideoPacketHeader | null {
     return null;
   }
 
-  const header = {
+  // All multi-byte fields in the chunk header are little-endian; the packed
+  // accelerometer sits where a timestamp would be expected.
+  return {
     magic: buf[0],
     type: buf[1],
-    streamId: buf.readUInt16BE(2),
-    frameId: buf.readUInt16BE(4),
-    seqNum: buf.readUInt16BE(12),
-    payloadSize: buf.readUInt16BE(14),
-    timestamp: buf.readUInt32BE(16),
+    frameId: buf.readUInt16LE(2),
+    packetIndex: buf.readUInt16LE(12),
+    payloadSize: buf.readUInt16LE(14),
+    accelRaw: buf.readUInt32LE(16),
   };
-
-  console.log(
-    `[AIRLOOK RX] video packet: type=${header.type} frameId=${header.frameId} streamId=${header.streamId} seq=${header.seqNum} payload=${header.payloadSize} ts=${header.timestamp}`,
-  );
-
-  return header;
 }
 
 export interface VideoPart {
   type: number;
   frameId: number;
+  /** Packet index within the frame (0-based). */
+  packetIndex: number;
+  /** Packed accelerometer word, identical in every chunk of one frame. */
+  accelRaw: number;
   payload: Buffer;
 }
 
@@ -369,6 +414,8 @@ export function parseVideoPacket(buf: Buffer): VideoPart | null {
   return {
     type: header.type,
     frameId: header.frameId,
+    packetIndex: header.packetIndex,
+    accelRaw: header.accelRaw,
     payload: buf.subarray(VIDEO_HEADER_SIZE),
   };
 }
@@ -376,6 +423,11 @@ export function parseVideoPacket(buf: Buffer): VideoPart | null {
 export interface AssembledFrame {
   frameId: number;
   jpeg: Buffer;
+  /**
+   * Accelerometer reading sampled once per frame on the camera side. Null for
+   * frames that could not be decoded (or assembled without a first chunk).
+   */
+  accel: AccelRaw | null;
 }
 
 /**
@@ -386,18 +438,25 @@ export interface AssembledFrame {
 export class VideoFrameAssembler {
   private currentFrameId: number | null = null;
   private currentFrameData: Buffer[] = [];
+  private currentAccel: AccelRaw | null = null;
+  private currentPacketIndex: number | null = null;
 
   push(part: VideoPart): AssembledFrame[] {
     const result: AssembledFrame[] = [];
 
     if (part.type === PacketType.SOI) {
+      // The accelerometer is identical across all chunks of a frame, so the
+      // value carried by the first chunk represents the whole frame.
       this.currentFrameId = part.frameId;
       this.currentFrameData = [part.payload];
+      this.currentAccel = decodeAccelerometer(part.accelRaw);
+      this.currentPacketIndex = part.packetIndex;
       return result;
     }
 
     if (part.type === PacketType.CONT && this.currentFrameId === part.frameId) {
       this.currentFrameData.push(part.payload);
+      this.currentPacketIndex = part.packetIndex;
       return result;
     }
 
@@ -410,19 +469,23 @@ export class VideoFrameAssembler {
       if (start >= 0 && end > start) {
         const jpeg = frame.subarray(start, end + 2);
         console.log(
-          `[AIRLOOK RX] assembled frame: id=${this.currentFrameId} size=${jpeg.length} bytes`,
+          `[AIRLOOK RX] assembled frame: id=${this.currentFrameId} size=${jpeg.length} bytes accel=${this.currentAccel?.raw ?? "-"}`,
         );
-        result.push({ frameId: this.currentFrameId, jpeg });
+        result.push({ frameId: this.currentFrameId, jpeg, accel: this.currentAccel });
       }
 
       this.currentFrameId = null;
       this.currentFrameData = [];
+      this.currentAccel = null;
+      this.currentPacketIndex = null;
       return result;
     }
 
     if (part.frameId !== this.currentFrameId) {
       this.currentFrameId = null;
       this.currentFrameData = [];
+      this.currentAccel = null;
+      this.currentPacketIndex = null;
     }
 
     return result;
@@ -431,5 +494,7 @@ export class VideoFrameAssembler {
   reset(): void {
     this.currentFrameId = null;
     this.currentFrameData = [];
+    this.currentAccel = null;
+    this.currentPacketIndex = null;
   }
 }

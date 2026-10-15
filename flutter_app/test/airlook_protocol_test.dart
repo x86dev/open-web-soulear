@@ -4,17 +4,16 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:soulear_local/src/airlook_protocol.dart';
 
-/// Builds a video packet the way the AIR-Look camera sends it (header per
-/// airlook-protocol.ts, big-endian).
-Uint8List makeVideoPacket(int type, int frameId, List<int> payload) {
+/// Builds a video packet the way the AIR-Look camera sends it (24-byte
+/// little-endian header, accel packed at [16:20]).
+Uint8List makeVideoPacket(int type, int frameId, List<int> payload, {int accelRaw = 0}) {
   final b = ByteData(videoHeaderSize);
   b.setUint8(0, videoMagic);
   b.setUint8(1, type);
-  b.setUint16(2, 1, Endian.big); // streamId
-  b.setUint16(4, frameId, Endian.big);
-  b.setUint16(12, 0, Endian.big); // seqNum
-  b.setUint16(14, payload.length, Endian.big); // payloadSize
-  b.setUint32(16, 0, Endian.big); // timestamp
+  b.setUint16(2, frameId, Endian.little);
+  b.setUint16(12, 0, Endian.little); // packet index
+  b.setUint16(14, payload.length, Endian.little); // payload size
+  b.setUint32(16, accelRaw, Endian.little); // packed accelerometer
   return Uint8List.fromList([...b.buffer.asUint8List(), ...payload]);
 }
 
@@ -60,12 +59,29 @@ void main() {
     expect(parseStatusResponse(Uint8List(4)), isNull);
   });
 
-  test('video packet parsed (big-endian header)', () {
+  test('video packet parsed (little-endian header)', () {
     final p = parseVideoPacket(makeVideoPacket(PacketType.soi, 42, [1, 2, 3]))!;
     expect(p.type, PacketType.soi);
     expect(p.frameId, 42);
+    expect(p.packetIndex, 0);
     expect(p.payload, [1, 2, 3]);
     expect(parseVideoPacket(Uint8List.fromList([0x00, ...Uint8List(30)])), isNull);
+  });
+
+  test('accelerometer decoded from the packed chunk-header word', () {
+    final raw = (100 << 20) | (200 << 10) | 300;
+    final p = parseVideoPacket(makeVideoPacket(PacketType.soi, 1, const [], accelRaw: raw))!;
+    expect(p.accelRaw, raw);
+    final a = decodeAccelerometer(p.accelRaw);
+    expect(a.x, 100);
+    expect(a.y, 200);
+    expect(a.z, 300);
+
+    // Axis limits: X is 12-bit, Y/Z are 10-bit.
+    final max = decodeAccelerometer(0xffffffff);
+    expect(max.x, 0xfff);
+    expect(max.y, 0x3ff);
+    expect(max.z, 0x3ff);
   });
 
   test('JPEG assembled from SOI/CONT/EOI', () {
@@ -75,6 +91,21 @@ void main() {
     final frame = a.push(parseVideoPacket(makeVideoPacket(PacketType.eoi, 7, [0x40, 0xff, 0xd9]))!)!;
     expect(frame.frameId, 7);
     expect(frame.jpeg, [0xff, 0xd8, 0x10, 0x20, 0x30, 0x40, 0xff, 0xd9]);
+  });
+
+  test('assembled frame carries the first chunk\'s accelerometer', () {
+    final raw = (11 << 20) | (22 << 10) | 33;
+    final a = VideoFrameAssembler();
+    expect(
+      a.push(parseVideoPacket(makeVideoPacket(PacketType.soi, 7, [0xff, 0xd8], accelRaw: raw))!),
+      isNull,
+    );
+    final frame = a.push(
+      parseVideoPacket(makeVideoPacket(PacketType.eoi, 7, [0xff, 0xd9])),
+    )!;
+    expect(frame.accel.x, 11);
+    expect(frame.accel.y, 22);
+    expect(frame.accel.z, 33);
   });
 
   test('foreign CONT/EOI without SOI are dropped', () {

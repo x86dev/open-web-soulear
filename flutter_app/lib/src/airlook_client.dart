@@ -37,7 +37,7 @@ class AirlookClient extends BaseCameraDriver {
   String get name => 'airlook';
 
   @override
-  CameraCapabilities get capabilities => const CameraCapabilities(led: true, battery: true, sensors: false);
+  CameraCapabilities get capabilities => const CameraCapabilities(led: true, battery: true, sensors: true);
 
   static const _requestTimeout = Duration(seconds: 3);
   static const _probeTimeout = Duration(milliseconds: 1500);
@@ -48,6 +48,10 @@ class AirlookClient extends BaseCameraDriver {
   RawDatagramSocket? _videoSock;
   Socket? _tcp;
   final _assembler = air.VideoFrameAssembler();
+
+  /// Smooths the per-frame accelerometer readings, same filtering as the
+  /// soulear driver (libWifiCamera's sensor_get_xyz).
+  final _smoother = SensorSmoother();
   Timer? _heartbeatTimer;
   Timer? _statusTimer;
   late InternetAddress _addr;
@@ -122,6 +126,7 @@ class AirlookClient extends BaseCameraDriver {
     _cmd = null;
     _videoSock = null;
     _assembler.reset();
+    _smoother.reset();
   }
 
   @override
@@ -253,7 +258,15 @@ class AirlookClient extends BaseCameraDriver {
       if (status.details['Resolution'] != res) {
         setStatus(status.copyWith(details: {...status.details, 'Resolution': res}));
       }
-      emitFrame(Frame(frame.jpeg, 0, 0, (0, 0, 0), (0, 0)));
+      emitFrame(Frame(frame.jpeg, 0, 0, (frame.accel.x, frame.accel.y, frame.accel.z), (0, 0)));
+
+      // The accelerometer travels in the video chunk header (one sample per
+      // frame), so it is the only sensor source for this camera. The header
+      // carries no flag bytes, hence the zero flags tuple.
+      emitSensor(_smoother.push(
+        (frame.accel.x, frame.accel.y, frame.accel.z),
+        (0, 0),
+      ));
       setStatus(status); // updates the frame rate centrally, among other things
     }
   }

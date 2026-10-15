@@ -26,6 +26,7 @@ import {
   type DeviceInfo,
 } from "./airlook-protocol.ts";
 import { CameraDriver, type DriverConfig, type ProbeResult } from "./types.js";
+import { SensorSmoother } from "./suear-protocol.ts";
 
 const REQUEST_TIMEOUT_MS = 3000;
 const PROBE_TIMEOUT_MS = 1500;
@@ -41,7 +42,7 @@ const STATUS_POLL_MS = 1800;
  */
 export class AirlookDriver extends CameraDriver {
   readonly name = "airlook";
-  readonly capabilities = { led: true, battery: true, sensors: false };
+  readonly capabilities = { led: true, battery: true, sensors: true };
 
   private cmdSock: dgram.Socket | null = null;
   private videoSock: dgram.Socket | null = null;
@@ -53,6 +54,12 @@ export class AirlookDriver extends CameraDriver {
   /** Monotonic index for Format-B requests (LED). */
   private seq = 0;
   private ledLogged = false;
+
+  /**
+   * Smooths the per-frame accelerometer readings, same filtering as the
+   * soulear driver (libWifiCamera's sensor_get_xyz).
+   */
+  private readonly smoother = new SensorSmoother();
 
   constructor(
     config: DriverConfig,
@@ -357,6 +364,15 @@ export class AirlookDriver extends CameraDriver {
 
     for (const frame of this.assembler.push(part)) {
       this.pushFrame(frame.jpeg);
+
+      // The accelerometer travels in the video chunk header (one sample per
+      // frame), so it is the only sensor source for this camera. The header
+      // carries no flag bytes, hence the empty flags tuple.
+      if (frame.accel) {
+        this.pushSensor(
+          this.smoother.push([frame.accel.x, frame.accel.y, frame.accel.z], [0, 0]),
+        );
+      }
     }
   }
 

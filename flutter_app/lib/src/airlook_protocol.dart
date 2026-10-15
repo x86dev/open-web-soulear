@@ -279,28 +279,79 @@ AirStatus? parseStatusResponse(Uint8List buf) {
 }
 
 class VideoPart {
-  const VideoPart(this.type, this.frameId, this.payload);
+  const VideoPart(this.type, this.frameId, this.packetIndex, this.accelRaw, this.payload);
   final int type;
   final int frameId;
+
+  /// Packet index within the current frame (0-based).
+  final int packetIndex;
+
+  /// Packed accelerometer word, identical in every chunk of one frame.
+  final int accelRaw;
   final Uint8List payload;
 }
 
-/// Header (24 Byte, big-endian): magic u8 | type u8 | streamId u16 | frameId u16
-/// | … | seqNum u16 (12) | payloadSize u16 (14) | timestamp u32 (16).
+/// Raw accelerometer axes as packed into the video chunk header.
+class AccelRaw {
+  const AccelRaw(this.x, this.y, this.z, this.raw);
+
+  /// 12-bit value (0..4095).
+  final int x;
+
+  /// 10-bit value (0..1023).
+  final int y;
+
+  /// 10-bit value (0..1023).
+  final int z;
+
+  /// The undecoded 32-bit word, for logging and debugging.
+  final int raw;
+}
+
+/// Decodes the packed accelerometer field from a video chunk header.
+///
+/// The 32-bit little-endian word at offset [16:20] packs three axes, matching
+/// the official app's StreamSelf.doExecuteMJPEG():
+///
+/// ```
+/// bit 31           20 19         10 9            0
+///  ┌───────────────┐┌─────────────┐┌─────────────┐
+///  │   X (12 bit)  ││  Y (10 bit) ││  Z (10 bit) │
+///  └───────────────┘└─────────────┘└─────────────┘
+/// ```
+///
+/// The values are raw ADC counts, not gs.
+///
+/// Source: https://github.com/tiktock/unofficial-airlook-web
+/// (analysis/video-stream.md)
+AccelRaw decodeAccelerometer(int raw) => AccelRaw(
+      (raw >> 20) & 0xfff,
+      (raw >> 10) & 0x3ff,
+      raw & 0x3ff,
+      raw & 0xffffffff,
+    );
+
+/// Header (24 Byte, little-endian): magic u8 | type u8 | frameId u16 (2) |
+/// … | packetIndex u16 (12) | payloadSize u16 (14) | accel u32 (16).
 VideoPart? parseVideoPacket(Uint8List buf) {
   if (buf.length < videoHeaderSize || buf[0] != videoMagic) return null;
   final b = ByteData.sublistView(buf);
   return VideoPart(
     b.getUint8(1),
-    b.getUint16(4, Endian.big),
+    b.getUint16(2, Endian.little),
+    b.getUint16(12, Endian.little),
+    b.getUint32(16, Endian.little),
     Uint8List.sublistView(buf, videoHeaderSize),
   );
 }
 
 class AirFrame {
-  const AirFrame(this.frameId, this.jpeg);
+  const AirFrame(this.frameId, this.jpeg, this.accel);
   final int frameId;
   final Uint8List jpeg;
+
+  /// Accelerometer reading sampled once per frame on the camera side.
+  final AccelRaw accel;
 }
 
 /// Assembles video packets into complete JPEG frames: SOI begins, CONT
@@ -308,11 +359,15 @@ class AirFrame {
 class VideoFrameAssembler {
   int? _currentFrameId;
   List<Uint8List> _currentFrameData = [];
+  AccelRaw? _currentAccel;
 
   AirFrame? push(VideoPart part) {
     if (part.type == PacketType.soi) {
+      // The accelerometer is identical across all chunks of a frame, so the
+      // value carried by the first chunk represents the whole frame.
       _currentFrameId = part.frameId;
       _currentFrameData = [part.payload];
+      _currentAccel = decodeAccelerometer(part.accelRaw);
       return null;
     }
 
@@ -324,14 +379,16 @@ class VideoFrameAssembler {
     if (part.type == PacketType.eoi && _currentFrameId == part.frameId) {
       _currentFrameData.add(part.payload);
       final frame = _concat(_currentFrameData);
+      final id = _currentFrameId!;
+      final accel = _currentAccel;
       _currentFrameId = null;
       _currentFrameData = [];
+      _currentAccel = null;
 
       final start = _indexOfSoi(frame);
       final end = _lastIndexOfEoi(frame);
-      if (start >= 0 && end > start) {
-        final id = part.frameId;
-        return AirFrame(id, Uint8List.sublistView(frame, start, end + 2));
+      if (start >= 0 && end > start && accel != null) {
+        return AirFrame(id, Uint8List.sublistView(frame, start, end + 2), accel);
       }
       return null;
     }
@@ -339,6 +396,7 @@ class VideoFrameAssembler {
     if (part.frameId != _currentFrameId) {
       _currentFrameId = null;
       _currentFrameData = [];
+      _currentAccel = null;
     }
     return null;
   }
@@ -346,6 +404,7 @@ class VideoFrameAssembler {
   void reset() {
     _currentFrameId = null;
     _currentFrameData = [];
+    _currentAccel = null;
   }
 }
 
