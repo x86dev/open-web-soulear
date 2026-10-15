@@ -6,7 +6,7 @@
     <!-- Fotos in die Galerie speichern (nur alte Android-Versionen) -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <application
-        android:label="Soulear lokal"
+        android:label="OpenEarcam"
         android:requestLegacyExternalStorage="true"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">

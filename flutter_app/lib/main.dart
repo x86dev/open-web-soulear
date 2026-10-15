@@ -21,7 +21,7 @@ class SoulearApp extends StatelessWidget {
           useMaterial3: true,
         );
     return MaterialApp(
-      title: 'Soulear lokal',
+      title: 'OpenEarcam',
       debugShowCheckedModeBanner: false,
       theme: theme(Brightness.light),
       darkTheme: theme(Brightness.dark),

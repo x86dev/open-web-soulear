@@ -51,14 +51,14 @@ und am Ende eine eigene App, die mit der echten Kamera läuft.
 
 Details: [docs/README-statische-analyse.md](docs/README-statische-analyse.md).
 
-## Ergebnis: die eigene App „Soulear lokal“
+## Ergebnis: die eigene App „OpenEarcam“
 
 Aus der Analyse entstanden: eine eigene, cloudfreie Web-App für die Kamera.
 Sie spricht das analysierte Protokoll direkt, läuft auf einem Rechner im
 WLAN der Kamera (Mac, Linux, Raspberry Pi) und wird im Browser bedient.
 Details: [app/README.md](app/README.md).
 
-![Soulear lokal mit der echten Kamera: stabilisiertes Livebild einer Beschriftung, daneben der Tab Lage mit Drehung, Neigung und Sensor-Rohwerten](docs/screenshot.png)
+![OpenEarcam mit der echten Kamera: stabilisiertes Livebild einer Beschriftung, daneben der Tab Lage mit Drehung, Neigung und Sensor-Rohwerten](docs/screenshot.png)
 
 ```
 Kamera ──UDP──▶ Backend (Node.js/TypeScript) ──HTTP──▶ Frontend (React + MUI) im Browser
@@ -105,7 +105,7 @@ Standard). Je nach Kamera: Livebild, Fotos (auch in die Galerie), LED, Akku,
 Lagesensor mit Stabilisierung. Getestet mit der echten Soulear-Kamera auf
 Android 16.
 
-<img src="docs/screenshot-android.png" alt="Soulear lokal als Android-App mit der echten Kamera: stabilisiertes Livebild, Bedienknöpfe und Tab Lage mit Sensorwerten" width="300">
+<img src="docs/screenshot-android.png" alt="OpenEarcam als Android-App mit der echten Kamera: stabilisiertes Livebild, Bedienknöpfe und Tab Lage mit Sensorwerten" width="300">
 
 ```bash
 cd flutter_app

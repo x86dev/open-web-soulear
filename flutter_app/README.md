@@ -1,11 +1,11 @@
-# Soulear lokal – Handy-App (Flutter)
+# OpenEarcam – Handy-App (Flutter)
 
 Native App für Android (und iOS) – spricht **direkt** per UDP mit der Kamera,
 ohne Backend, ohne Cloud. Gleicher Funktionsumfang wie die Web-App in
 [../app](../app/README.md): Livebild, Foto, LED an/aus, Akku, Lagesensor mit
 Bildstabilisierung, Galerie, Geräteinfo.
 
-<img src="../docs/screenshot-android.png" alt="Soulear lokal als Android-App mit der echten Kamera: stabilisiertes Livebild, Bedienknöpfe und Tab Lage mit Sensorwerten" width="300">
+<img src="../docs/screenshot-android.png" alt="OpenEarcam als Android-App mit der echten Kamera: stabilisiertes Livebild, Bedienknöpfe und Tab Lage mit Sensorwerten" width="300">
 
 | Teil | Status |
 |---|---|
@@ -41,7 +41,7 @@ Handy ausreichend, nicht für den Play Store.
 2. App öffnen – sie verbindet sich automatisch (Standard: Kamera-Typ „auto“,
    IP `192.168.1.1`). Im Tab **Gerät** lässt sich der Kameratyp
    (`auto`/`soulear`/`airlook`) und die IP ändern.
-3. Fotos landen in der App **und** in der Galerie (Album „Soulear lokal“).
+3. Fotos landen in der App **und** in der Galerie (Album „OpenEarcam“).
 
 **Warum die App sich ans WLAN bindet:** Weil das Kamera-WLAN kein Internet
 hat, schickt Android Verbindungen sonst über die mobilen Daten – dann ist die

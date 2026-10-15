@@ -25,7 +25,7 @@ class HomePage extends StatelessWidget {
             title: Row(children: [
               Icon(Icons.videocam, color: Theme.of(context).colorScheme.primary),
               const SizedBox(width: 10),
-              const Flexible(child: Text('Soulear lokal', overflow: TextOverflow.ellipsis)),
+              const Flexible(child: Text('OpenEarcam', overflow: TextOverflow.ellipsis)),
             ]),
             actions: [
               ValueListenableBuilder(

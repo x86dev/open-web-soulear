@@ -1,9 +1,9 @@
-# Soulear lokal – eigene Web-App für die Ohrkamera
+# OpenEarcam – eigene Web-App für die Ohrkamera
 
 Gedacht vor allem als **Makro-/Inspektionskamera für Platinen und
 Lötstellen** am Rechner (siehe [Motivation](../README.md#motivation)).
 
-![Soulear lokal mit der echten Kamera: stabilisiertes Livebild einer Beschriftung, daneben der Tab Lage mit Drehung, Neigung und Sensor-Rohwerten](../docs/screenshot.png)
+![OpenEarcam mit der echten Kamera: stabilisiertes Livebild einer Beschriftung, daneben der Tab Lage mit Drehung, Neigung und Sensor-Rohwerten](../docs/screenshot.png)
 
 Ersatz für die Hersteller-App: ein **Node.js/TypeScript-Backend**, das im
 WLAN der Kamera läuft (Laptop, Raspberry Pi), und ein **React-Frontend** im

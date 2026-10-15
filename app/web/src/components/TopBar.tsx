@@ -26,7 +26,7 @@ export function TopBar({ status }: { status: CameraStatus | null }) {
       <Toolbar variant="dense" sx={{ gap: 1.5, minHeight: { xs: 52, md: 56 }, px: { xs: 1.5, md: 2 } }}>
         <VideocamIcon color="primary" />
         <Typography variant="h6" component="h1" noWrap sx={{ flexGrow: 1, fontSize: { xs: "1.05rem", md: "1.2rem" } }}>
-          Soulear lokal
+          OpenEarcam
         </Typography>
 
         {!status ? (

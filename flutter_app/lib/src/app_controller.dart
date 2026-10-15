@@ -203,7 +203,7 @@ class AppController extends ChangeNotifier {
     photos = files;
   }
 
-  /// Speichert das aktuelle Bild in der App und in der Galerie (Album „Soulear lokal“).
+  /// Speichert das aktuelle Bild in der App und in der Galerie (Album „OpenEarcam“).
   /// Gibt eine Meldung für die Oberfläche zurück.
   Future<String> takePhoto() async {
     final f = frame.value;
@@ -217,7 +217,7 @@ class AppController extends ChangeNotifier {
     photos = [file, ...photos];
     notifyListeners();
     try {
-      await Gal.putImageBytes(f.jpeg, album: 'Soulear lokal', name: name.replaceAll('.jpg', ''));
+      await Gal.putImageBytes(f.jpeg, album: 'OpenEarcam', name: name.replaceAll('.jpg', ''));
       return 'Foto gespeichert (auch in der Galerie)';
     } catch (e) {
       return 'Foto in der App gespeichert – Galerie: $e';

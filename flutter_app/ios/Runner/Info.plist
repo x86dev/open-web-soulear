@@ -7,13 +7,13 @@
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Aufgenommene Fotos werden in deiner Fotomediathek gespeichert.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Aufgenommene Fotos werden im Album „Soulear lokal“ gespeichert.</string>
+	<string>Aufgenommene Fotos werden im Album „OpenEarcam“ gespeichert.</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Soulear lokal</string>
+	<string>OpenEarcam</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
