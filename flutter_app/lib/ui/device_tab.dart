@@ -27,6 +27,17 @@ class _DeviceTabState extends State<DeviceTab> {
   }
 
   @override
+  void didUpdateWidget(covariant DeviceTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Keep the field in sync if the controller instance changed.
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_syncIp);
+      widget.controller.addListener(_syncIp);
+    }
+    _syncIp();
+  }
+
+  @override
   void dispose() {
     widget.controller.removeListener(_syncIp);
     _ip.dispose();
@@ -65,6 +76,8 @@ class _DeviceTabState extends State<DeviceTab> {
       Text('KAMERA-TYP', style: text.labelSmall),
       const SizedBox(height: 8),
       DropdownButtonFormField<String>(
+        // Key on the driver so the field rebuilds with the new selection.
+        key: ValueKey(widget.controller.driver),
         initialValue: widget.controller.driver,
         isExpanded: true,
         decoration: const InputDecoration(border: OutlineInputBorder(), isDense: true),

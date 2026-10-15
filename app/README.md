@@ -25,7 +25,9 @@ Kamera ──UDP──▶ Node-Backend (Fastify) ──MJPEG/REST──▶ React
 | Treiber `mock` – künstliches Bild, zum Entwickeln ohne Hardware | fertig |
 | Treiber `replay` – spielt JPEG-Frames aus einem Mitschnitt ab | fertig |
 | Treiber `soulear` – echte Kamera (Livebild, Akku, Geräteinfo, LED, Lagesensor) | **läuft mit echter Kamera** (siehe unten) |
-| Simulierte Kamera (`npm run fake-camera`) | fertig |
+| Treiber `airlook` – AIR-Look/JesHome-Kameras (Livebild, Akku in %, LED an/aus) | nach Reverse-Engineering umgesetzt, Protokoll aus `unofficial-airlook-web` |
+| Treiber `auto` – probiert `soulear` → `airlook` und nimmt den ersten, der antwortet | fertig, Standard-Treiber |
+| Simulierte Kamera (`npm run fake-camera`) | fertig ('soulear') |
 | pcap-Werkzeug zur Protokoll-Analyse | fertig |
 
 ## Schnellstart
@@ -91,6 +93,26 @@ Rohantwort steht einmalig im Log (`LED-Abfrage: Antwort …`).
   wohin die Kamera sendet (Filter `udp && ip.src==192.168.1.1`), und
   `STREAM_PORTS` anpassen.
 - Dann weiter mit einem Mitschnitt der Original-App (unten).
+
+## Mit einer AIR-Look-Kamera
+
+AIR-Look/JesHome-Kameras (z. B. Enjoy-866/MoLink TX816) nutzen ein anderes
+Protokoll als Soulear. Mit `DRIVER=airlook` (oder automatisch über `auto`)
+werden Livebild, **Akkustand in Prozent** (Spannung + Ladezustand) und die
+**LED** (an/aus) unterstützt. Es gibt keinen Lagesensor.
+
+- LED: Format-B-Befehl `setPwm`/`getPwm` (`0x1016`/`0x1015`). Die LED ist
+  binär (0 = aus, jeder Wert ≠ 0 = an); der Hersteller schaltet sie beim
+  Einschalten standardmäßig ein, der Treiber liest den Zustand nach dem
+  Verbinden aus.
+- Akku: `getBattery` (`0x1017`), liefert Spannung (mV), Ladezustand und
+  Prozentwert. Ohne Batterie-Telemetrie (ältere Firmware) bleibt der Prozentwert
+  leer statt 0 % anzuzeigen.
+
+Das Protokoll stammt aus dem Reverse-Engineering von
+[`tiktock/unofficial-airlook-web`](https://github.com/tiktock/unofficial-airlook-web).
+Zum Ausprobieren weiterer Befehle: `python3 tools/airlook_fuzz.py` (nur im
+Kamera-WLAN).
 
 ### Protokoll (Kurzfassung)
 

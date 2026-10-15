@@ -9,12 +9,17 @@ import dgram from "node:dgram";
 import net from "node:net";
 import {
   parseDiscoveryResponse,
-  parseStatusResponse,
   parseVideoPacket,
   VideoFrameAssembler,
   encodeDiscoveryRequest,
   encodeStartStreamingCommand,
-  encodeStatusRequest,
+  encodeSetLed,
+  encodeGetLed,
+  parseLedStatus,
+  encodeGetBattery,
+  parseBatteryResponse,
+  encodeGetBoardInfo,
+  parseBoardInfo,
   DISCOVERY_PORT,
   VIDEO_PORT,
   CONTROL_PORT,
@@ -36,7 +41,7 @@ const STATUS_POLL_MS = 1800;
  */
 export class AirlookDriver extends CameraDriver {
   readonly name = "airlook";
-  readonly capabilities = { led: false, battery: true, sensors: false };
+  readonly capabilities = { led: true, battery: true, sensors: false };
 
   private cmdSock: dgram.Socket | null = null;
   private videoSock: dgram.Socket | null = null;
@@ -45,6 +50,9 @@ export class AirlookDriver extends CameraDriver {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private statusTimer: NodeJS.Timeout | null = null;
   private deviceInfo: DeviceInfo | null = null;
+  /** Monotonic index for Format-B requests (LED). */
+  private seq = 0;
+  private ledLogged = false;
 
   constructor(
     config: DriverConfig,
@@ -118,6 +126,10 @@ export class AirlookDriver extends CameraDriver {
       this.connectTcp();
       this.startVideo();
 
+      // Read the LED state once immediately, so the UI matches the device
+      // (the LED is on at power-on) instead of waiting for the first poll.
+      await this.readLed().catch(() => undefined);
+
       this.heartbeatTimer = setInterval(() => this.sendVideoHeartbeat(), VIDEO_HEARTBEAT_MS);
       this.statusTimer = setInterval(() => this.pollStatus(), STATUS_POLL_MS);
     } catch (err) {
@@ -151,53 +163,125 @@ export class AirlookDriver extends CameraDriver {
   }
 
   private async discover(): Promise<void> {
-    const req = encodeDiscoveryRequest();
+    const req = encodeGetBoardInfo(++this.seq);
     const res = await this.sendRequest(this.config.cameraCmdPort, req);
-    const parsed = parseDiscoveryResponse(res);
+    const info = parseBoardInfo(res);
 
-    if (!parsed) {
+    if (!info) {
       throw new Error(
         `Camera did not respond (${this.config.cameraIp}:${this.config.cameraCmdPort}).`,
       );
     }
 
-    try {
-      this.deviceInfo = JSON.parse(parsed[1]) as DeviceInfo;
-      console.log("[AIRLOOK] discovery payload:", this.deviceInfo);
-    } catch (err) {
-      console.error("[AIRLOOK] discovery JSON parse error:", err);
-      throw new Error("Discovery: invalid JSON response");
-    }
+    this.deviceInfo = info;
+    console.log("[AIRLOOK] board info:", info);
 
+    // Build a readable detail set for the device tab. Only include non-empty
+    // fields so the UI does not show blank rows.
+    const entries: Record<string, string> = {
+      manufacturer: info.manufacturer || info.brand || "unknown",
+      model: info.model || "unknown",
+      hardware: info.hardware,
+      firmware: info.firmware,
+      fwDate: info.fwDate,
+      soc: info.soc,
+      mac: info.mac,
+      streamType: info.streamType,
+    };
     this.details = {
       ...this.details,
-      manufacturer: this.deviceInfo?.manufacturer ?? "unknown",
-      model: this.deviceInfo?.model ?? "unknown",
-      firmware: this.deviceInfo?.firmware ?? "unknown",
-      mac: this.deviceInfo?.mac ?? "unknown",
+      ...Object.fromEntries(Object.entries(entries).filter(([, v]) => v !== "")),
     };
   }
 
   private async pollStatus(): Promise<void> {
     try {
-      const req = encodeStatusRequest();
-      const res = await this.sendStatusRequest(this.config.cameraCmdPort, req);
-      const status = parseStatusResponse(res);
+      // get_battery (0x1017) carries voltage, charge state and percentage.
+      const res = await this.sendFormatB(encodeGetBattery(++this.seq));
+      const battery = res ? parseBatteryResponse(res) : null;
 
-      if (!status) {
-        return;
+      if (battery) {
+        if (battery.percent !== null) this.battery = battery.percent;
+        this.details = {
+          ...this.details,
+          ...(battery.voltage !== null ? { voltage: `${battery.voltage} mV` } : {}),
+          Laden: battery.charging ? "ja" : "nein",
+        };
+        this.error = null;
+        console.log(
+          `[AIRLOOK] battery: voltage=${battery.voltage ?? "?"} mV ` +
+            `percent=${battery.percent ?? "?"}% charging=${battery.charging} full=${battery.full}`,
+        );
       }
-
-      this.battery = Math.min(100, Math.max(0, status.battery));
-      this.details = {
-        ...this.details,
-        voltage: `${status.voltage} mV`,
-      };
-      this.error = null;
-      console.log(`[AIRLOOK] status: voltage=${status.voltage} mV battery=${status.battery}%`);
     } catch (err) {
       console.warn("[AIRLOOK] status poll failed:", (err as Error).message);
     }
+
+    // Read the LED state alongside the battery (best effort).
+    await this.readLed().catch(() => undefined);
+  }
+
+  /**
+   * Sets the LED brightness 0-100 (0 = off). The command travels on the
+   * control port as a Format-B 0x9999 packet (opcode 0x1016, value in the int
+   * slot). On the P6X the LED is binary, so any non-zero value looks the same.
+   */
+  /**
+   * Sets the LED. The AIR-Look LED is binary (off = 0, on = any non-zero
+   * value), so any requested level > 0 is sent as 1. The command travels on the
+   * control port as a Format-B 0x9999 packet (opcode 0x1016).
+   */
+  override async setLed(level: number): Promise<void> {
+    const value = level > 0 ? 1 : 0;
+    const res = await this.sendFormatB(encodeSetLed(value, ++this.seq));
+    if (!res) throw new Error("SetLed: no response from the camera");
+    this.led = value;
+    // Align the display with the actual state, like the soulear driver does.
+    await this.readLed().catch(() => undefined);
+  }
+
+  /** Reads the LED value from the camera (GetPwm 0x1015); keeps the old value on failure. */
+  private async readLed(): Promise<void> {
+    const res = await this.sendFormatB(encodeGetLed(++this.seq));
+    const raw = res ? parseLedStatus(res) : null;
+    if (!this.ledLogged) {
+      this.ledLogged = true;
+      console.log(`[AIRLOOK] LED query -> ${res ? res.toString("hex") : "(no response)"} => ${raw ?? "unreadable"}`);
+    }
+    // The LED is binary: 0 = off, any non-zero value = on.
+    if (raw !== null) this.led = raw > 0 ? 1 : 0;
+  }
+
+  /** Sends a Format-B packet on the command socket and returns the raw reply. */
+  private sendFormatB(packet: Buffer): Promise<Buffer | null> {
+    return new Promise((resolve) => {
+      const sock = this.cmdSock;
+      if (!sock) {
+        resolve(null);
+        return;
+      }
+      const port = this.config.cameraCmdPort;
+      const onMessage = (buf: Buffer, rinfo: dgram.RemoteInfo) => {
+        if (rinfo.address !== this.config.cameraIp) return;
+        cleanup();
+        resolve(buf);
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve(null);
+      }, REQUEST_TIMEOUT_MS);
+      const cleanup = () => {
+        clearTimeout(timer);
+        sock.off("message", onMessage);
+      };
+      sock.on("message", onMessage);
+      sock.send(packet, port, this.config.cameraIp, (err) => {
+        if (err) {
+          cleanup();
+          resolve(null);
+        }
+      });
+    });
   }
 
   private startVideo(): void {
@@ -309,50 +393,6 @@ export class AirlookDriver extends CameraDriver {
         if (err) {
           cleanup();
           console.error("[AIRLOOK] UDP send failed:", err.message);
-          reject(err);
-        }
-      });
-    });
-  }
-
-  private sendStatusRequest(
-    port: number,
-    data: Buffer,
-    timeoutMs = REQUEST_TIMEOUT_MS,
-  ): Promise<Buffer> {
-    return new Promise((resolve, reject) => {
-      const sock = dgram.createSocket({ type: "udp4" });
-      const timer = setTimeout(() => {
-        sock.close();
-        reject(new Error(`Status request timed out while talking to ${this.config.cameraIp}:${port}`));
-      }, timeoutMs);
-
-      const onMessage = (buf: Buffer, rinfo: dgram.RemoteInfo) => {
-        if (rinfo.address !== this.config.cameraIp) {
-          return;
-        }
-
-        console.log(
-          `[AIRLOOK RX] status response from ${rinfo.address}:${rinfo.port} -> ${buf.length} bytes`,
-        );
-        clearTimeout(timer);
-        sock.close();
-        resolve(buf);
-      };
-
-      sock.once("message", onMessage);
-      sock.once("error", (err) => {
-        clearTimeout(timer);
-        sock.close();
-        console.error("[AIRLOOK] status socket error:", err.message);
-        reject(err);
-      });
-
-      sock.send(data, port, this.config.cameraIp, (err) => {
-        if (err) {
-          clearTimeout(timer);
-          sock.close();
-          console.error("[AIRLOOK] status send failed:", err.message);
           reject(err);
         }
       });

@@ -27,10 +27,46 @@ abstract final class AirMessageType {
   static const status = 0x1710;
 }
 
+/// Board-info opcode. `getBoardInfo` (0x1060) returns a length-prefixed JSON
+/// blob (brand, model, firmware, MAC, ...).
+///
+/// Reply layout (buffer offsets, after the 4-byte magic+opcode echo):
+///   [4:8]   index echo
+///   [8:12]  (unknown status word)
+///   [12:16] payload length (LE u32)
+///   [16:20] (unknown)
+///   [24:..] JSON payload (NUL-terminated)
+///
+/// Source: https://github.com/tiktock/unofficial-airlook-web (analysis/opcodes.md)
+abstract final class BoardInfoOpcode {
+  static const getBoardInfo = 0x1060;
+}
+
+/// LED-control opcodes. The camera LED is driven through a PWM channel:
+/// set it with [setPwm] and read it back with [getPwm]. On the P6X the LED is
+/// binary (any non-zero value lights it as bright as 1).
+///
+/// Source: https://github.com/tiktock/unofficial-airlook-web (analysis/opcodes.md)
+abstract final class LedOpcode {
+  static const getPwm = 0x1015;
+  static const setPwm = 0x1016;
+}
+
 abstract final class PacketType {
   static const soi = 0x01; // Start of image
   static const cont = 0x03; // continuation
   static const eoi = 0x02; // End of image
+}
+
+/// Battery opcode. `getBattery` (0x1017) is polled at ~2 Hz by the official
+/// app. Response layout (after the 4-byte magic+opcode echo):
+///   [4:6]   voltage in mV (LE u16)
+///   [6]     charge-state bitfield (bit0 = charging current, bit1 = full)
+///   [12:16] v1_src - packs (percent | 0x10000) when the data is valid
+///
+/// Source: https://github.com/tiktock/unofficial-airlook-web (analysis/battery.md)
+abstract final class BatteryOpcode {
+  static const getBattery = 0x1017;
 }
 
 class AirDeviceInfo {
@@ -121,6 +157,73 @@ Uint8List encodeStartStreamingCommand() {
   return buf.buffer.asUint8List();
 }
 
+/// Encodes a Format-B (0x9999) control packet: magic | opcode | index u32 |
+/// int parameter u32 | 12 zero bytes. Used for the LED (PWM) commands.
+Uint8List _encodeFormatB(int opcode, int intParam, int index) {
+  final buf = ByteData(headerSize);
+  buf.setUint16(0, discoveryMagic, Endian.little);
+  buf.setUint16(2, opcode, Endian.little);
+  buf.setUint32(4, index & 0xffffffff, Endian.little);
+  buf.setUint32(8, intParam & 0xffffffff, Endian.little);
+  return buf.buffer.asUint8List();
+}
+
+/// SetPwm command: switches the LED on (value 1-100) or off (value 0).
+Uint8List encodeSetLed(int level, [int index = 0]) {
+  final value = level.clamp(0, 100);
+  return _encodeFormatB(LedOpcode.setPwm, value, index);
+}
+
+/// GetPwm command: reads the current LED value.
+Uint8List encodeGetLed([int index = 0]) => _encodeFormatB(LedOpcode.getPwm, 0, index);
+
+/// Parses a GetPwm response -> LED value (0 = off). The reply echoes magic +
+/// opcode (4 bytes), then the 4-byte index echo, then the value at payload
+/// offset [4:8] - i.e. buffer offset [8:12] (LE u32). Null if it does not match.
+int? parseLedStatus(Uint8List buf) {
+  if (buf.length < 12) return null;
+  final b = ByteData.sublistView(buf);
+  if (b.getUint16(0, Endian.little) != discoveryMagic) return null;
+  if (b.getUint16(2, Endian.little) != LedOpcode.getPwm) return null;
+  return b.getUint32(8, Endian.little);
+}
+
+/// Encodes a getBattery command (Format B, opcode 0x1017).
+Uint8List encodeGetBattery([int index = 0]) => _encodeFormatB(BatteryOpcode.getBattery, 0, index);
+
+class BatteryReading {
+  const BatteryReading({this.voltage, this.percent, this.charging = false, this.full = false});
+
+  /// Voltage in mV, or null if the reply carried no plausible reading.
+  final int? voltage;
+
+  /// 0-100, or null if the firmware reports no battery telemetry.
+  final int? percent;
+  final bool charging;
+  final bool full;
+}
+
+/// Parses a getBattery response. The reply echoes magic + opcode (4 bytes),
+/// then the payload documented at [BatteryOpcode], so payload offsets are
+/// shifted by 4. Null if it does not match.
+BatteryReading? parseBatteryResponse(Uint8List buf) {
+  if (buf.length < 20) return null;
+  final b = ByteData.sublistView(buf);
+  if (b.getUint16(0, Endian.little) != discoveryMagic) return null;
+  if (b.getUint16(2, Endian.little) != BatteryOpcode.getBattery) return null;
+
+  final voltage = b.getUint16(8, Endian.little); // payload [4:6]
+  final chargeByte = b.getUint8(10); // payload [6]
+  final v1 = b.getUint32(16, Endian.little); // payload [12:16]
+  final percent = (v1 & 0x10000) != 0 ? (v1 & 0xffff) : null;
+  return BatteryReading(
+    voltage: voltage > 0 ? voltage : null,
+    percent: percent?.clamp(0, 100),
+    charging: (chargeByte & 0x01) != 0,
+    full: (chargeByte & 0x02) != 0,
+  );
+}
+
 /// Parses a discovery response: [header, JSON payload] - JSON starts at '{'.
 (int, String)? parseDiscoveryResponse(Uint8List buf) {
   if (buf.length < 8 || ByteData.sublistView(buf).getUint16(0, Endian.little) != discoveryMagic) {
@@ -130,6 +233,40 @@ Uint8List encodeStartStreamingCommand() {
   if (jsonStartIndex == -1) return null;
   final jsonString = utf8.decode(buf.sublist(jsonStartIndex), allowMalformed: true);
   return (ByteData.sublistView(buf).getUint16(2, Endian.little), jsonString);
+}
+
+/// Encodes a getBoardInfo command (Format B, opcode 0x1060).
+Uint8List encodeGetBoardInfo([int index = 0]) => _encodeFormatB(BoardInfoOpcode.getBoardInfo, 0, index);
+
+/// Parses a getBoardInfo response into the board-info JSON.
+///
+/// Follows the documented layout: the payload length is a LE u32 at buffer
+/// offset [12:16], and the JSON starts at buffer offset 24. Falls back to
+/// "first '{' to end" if the length field looks implausible.
+AirDeviceInfo? parseBoardInfo(Uint8List buf) {
+  if (buf.length < 24) return null;
+  final b = ByteData.sublistView(buf);
+  if (b.getUint16(0, Endian.little) != discoveryMagic) return null;
+  if (b.getUint16(2, Endian.little) != BoardInfoOpcode.getBoardInfo) return null;
+
+  final declared = b.getUint32(12, Endian.little);
+  Uint8List payload;
+  if (declared > 0 && declared <= buf.length - 24) {
+    payload = Uint8List.sublistView(buf, 24, 24 + declared);
+  } else {
+    final brace = buf.indexOf(0x7b); // '{'
+    if (brace == -1) return null;
+    payload = Uint8List.sublistView(buf, brace);
+  }
+
+  // The JSON is NUL-terminated (padded to the packet size).
+  final nul = payload.indexOf(0);
+  final text = utf8.decode(nul == -1 ? payload : payload.sublist(0, nul), allowMalformed: true);
+  try {
+    return AirDeviceInfo.fromJson(jsonDecode(text) as Map<String, dynamic>);
+  } catch (_) {
+    return null;
+  }
 }
 
 /// Parses voltage (mV) and battery level (%) from a status response.

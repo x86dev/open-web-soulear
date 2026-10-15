@@ -11,7 +11,7 @@ Bildstabilisierung, Galerie, Geräteinfo.
 |---|---|
 | Protokoll in Dart (`lib/src/protocol.dart`) | fertig, Unit-Tests |
 | Soulear-Treiber (`lib/src/soulear_client.dart`) | fertig, gegen die simulierte Kamera getestet |
-| AIR-Look-Treiber (`lib/src/airlook_client.dart`) | nach `app/server/src/camera/airlook.ts` umgesetzt, Unit-Tests für das Protokoll |
+| AIR-Look-Treiber (`lib/src/airlook_client.dart`) | Livebild, Akku in % und LED an/aus; Protokoll aus `unofficial-airlook-web`, Unit-Tests |
 | Auto-Treiber (`lib/src/auto_client.dart`) | probiert Soulear → AIR-Look; Standard |
 | Oberfläche Handy/Tablet, hell/dunkel | fertig, Layout-Tests ohne Überläufe |
 | Android-Build | APK baut (Release arm64: ~18 MB) |

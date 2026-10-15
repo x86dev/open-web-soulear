@@ -23,10 +23,52 @@ export const MessageType = {
   STATUS: 0x1710,
 } as const;
 
+/**
+ * Board-info opcode. `get_board_info` (0x1060) returns a length-prefixed JSON
+ * blob (brand, model, firmware, MAC, ...).
+ *
+ * Reply layout (buffer offsets, after the 4-byte magic+opcode echo):
+ *   [4:8]   index echo
+ *   [8:12]  (unknown status word)
+ *   [12:16] payload length (LE u32)
+ *   [16:20] (unknown)
+ *   [24:..] JSON payload (NUL-terminated)
+ *
+ * Source: https://github.com/tiktock/unofficial-airlook-web (analysis/opcodes.md)
+ */
+export const BoardInfoOpcode = {
+  GetBoardInfo: 0x1060,
+} as const;
+
+/**
+ * LED-control opcodes. The camera LED is driven through a PWM channel:
+ * set it with [SetPwm] and read it back with [GetPwm]. On the P6X the LED is
+ * binary (any non-zero value lights it as bright as 1).
+ *
+ * Source: https://github.com/tiktock/unofficial-airlook-web (analysis/opcodes.md)
+ */
+export const LedOpcode = {
+  GetPwm: 0x1015,
+  SetPwm: 0x1016,
+} as const;
+
 export const PacketType = {
   SOI: 0x01,
   CONT: 0x03,
   EOI: 0x02,
+} as const;
+
+/**
+ * Battery opcode. `get_battery` (0x1017) is polled at ~2 Hz by the official
+ * app. Response layout (after the 4-byte magic+opcode echo):
+ *   [4:6]  voltage in mV (LE u16)
+ *   [6]    charge-state bitfield (bit0 = charging current, bit1 = full)
+ *   [12:16] v1_src - packs (percent | 0x10000) when the data is valid
+ *
+ * Source: https://github.com/tiktock/unofficial-airlook-web (analysis/battery.md)
+ */
+export const BatteryOpcode = {
+  GetBattery: 0x1017,
 } as const;
 
 export interface DeviceInfo {
@@ -116,6 +158,89 @@ export function encodeStartStreamingCommand(): Buffer {
 }
 
 /**
+ * Encodes a Format-B (0x9999) control packet: magic | opcode | index u32 |
+ * int param u32 | 12 zero bytes. Used for the LED (PWM) commands.
+ */
+function encodeFormatB(opcode: number, intParam: number, index: number): Buffer {
+  const buf = Buffer.alloc(HEADER_SIZE);
+  buf.writeUInt16LE(DISCOVERY_MAGIC, 0);
+  buf.writeUInt16LE(opcode, 2);
+  buf.writeUInt32LE(index >>> 0, 4);
+  buf.writeUInt32LE(intParam >>> 0, 8);
+  return buf;
+}
+
+/**
+ * Encodes a SetPwm command that switches the LED on (value 0-100) or off
+ * (value 0). Returns the packet and the index used (for response matching).
+ */
+export function encodeSetLed(level: number, index = 0): Buffer {
+  const value = Math.max(0, Math.min(100, Math.round(level)));
+  const buf = encodeFormatB(LedOpcode.SetPwm, value, index);
+  console.log(`[AIRLOOK TX] set led ${value} -> ${formatHex(buf)}`);
+  return buf;
+}
+
+/**
+ * Encodes a GetPwm command to read the current LED value.
+ */
+export function encodeGetLed(index = 0): Buffer {
+  const buf = encodeFormatB(LedOpcode.GetPwm, 0, index);
+  console.log(`[AIRLOOK TX] get led -> ${formatHex(buf)}`);
+  return buf;
+}
+
+/**
+ * Parses a GetPwm response -> LED value (0 = off). The reply echoes magic +
+ * opcode (4 bytes), then the 4-byte index echo, then the value at payload
+ * offset [4:8] - i.e. buffer offset [8:12] (LE u32). Null if it does not match.
+ */
+export function parseLedStatus(buf: Buffer): number | null {
+  if (buf.length < 12 || buf.readUInt16LE(0) !== DISCOVERY_MAGIC) return null;
+  if (buf.readUInt16LE(2) !== LedOpcode.GetPwm) return null;
+  return buf.readUInt32LE(8);
+}
+
+/** Encodes a get_battery command (Format B, opcode 0x1017). */
+export function encodeGetBattery(index = 0): Buffer {
+  const buf = encodeFormatB(BatteryOpcode.GetBattery, 0, index);
+  console.log(`[AIRLOOK TX] get battery -> ${formatHex(buf)}`);
+  return buf;
+}
+
+export interface BatteryReading {
+  /** Voltage in mV, if the reply carried a plausible reading. */
+  voltage: number | null;
+  /** 0-100, or null if the firmware reports no battery telemetry. */
+  percent: number | null;
+  charging: boolean;
+  full: boolean;
+}
+
+/**
+ * Parses a get_battery response. The reply echoes magic + opcode, then the
+ * payload documented in BatteryOpcode. Returns null if the reply is not a
+ * matching get_battery response.
+ */
+export function parseBatteryResponse(buf: Buffer): BatteryReading | null {
+  if (buf.length < 20 || buf.readUInt16LE(0) !== DISCOVERY_MAGIC) return null;
+  if (buf.readUInt16LE(2) !== BatteryOpcode.GetBattery) return null;
+
+  // The reply echoes magic + opcode (4 bytes) before the payload, so the
+  // documented payload offsets are shifted by 4.
+  const voltage = buf.readUInt16LE(8); // payload [4:6]
+  const chargeByte = buf.readUInt8(10); // payload [6]
+  const v1 = buf.readUInt32LE(16); // payload [12:16]
+  const percent = v1 & 0x10000 ? v1 & 0xffff : null;
+  return {
+    voltage: voltage > 0 ? voltage : null,
+    percent: percent === null ? null : Math.min(100, Math.max(0, percent)),
+    charging: (chargeByte & 0x01) !== 0,
+    full: (chargeByte & 0x02) !== 0,
+  };
+}
+
+/**
  * Parses a discovery response.
  * The payload begins at the first JSON object brace in the reply.
  */
@@ -138,6 +263,46 @@ export function parseDiscoveryResponse(
 
   const jsonString = buf.toString("utf8", jsonStartIndex);
   return [header, jsonString];
+}
+
+/** Encodes a get_board_info command (Format B, opcode 0x1060). */
+export function encodeGetBoardInfo(index = 0): Buffer {
+  const buf = encodeFormatB(BoardInfoOpcode.GetBoardInfo, 0, index);
+  console.log(`[AIRLOOK TX] get board info -> ${formatHex(buf)}`);
+  return buf;
+}
+
+/**
+ * Parses a get_board_info response into the board-info JSON.
+ *
+ * Follows the documented layout: the payload length is a LE u32 at buffer
+ * offset [12:16], and the JSON starts at buffer offset 24. Falls back to
+ * "first '{' to end" if the length field looks implausible, so it also works
+ * with the earlier, looser discovery parsing.
+ */
+export function parseBoardInfo(buf: Buffer): DeviceInfo | null {
+  if (buf.length < 24 || buf.readUInt16LE(0) !== DISCOVERY_MAGIC) return null;
+  if (buf.readUInt16LE(2) !== BoardInfoOpcode.GetBoardInfo) return null;
+
+  const declared = buf.readUInt32LE(12);
+  let payload: Buffer;
+  if (declared > 0 && declared <= buf.length - 24) {
+    payload = buf.subarray(24, 24 + declared);
+  } else {
+    const brace = buf.indexOf("{");
+    if (brace === -1) return null;
+    payload = buf.subarray(brace);
+  }
+
+  // The JSON is NUL-terminated (padded to the packet size).
+  const nul = payload.indexOf(0);
+  const text = payload.subarray(0, nul === -1 ? payload.length : nul).toString("utf8");
+  try {
+    return JSON.parse(text) as DeviceInfo;
+  } catch {
+    console.log(`[AIRLOOK RX] board info JSON parse error -> ${formatHex(payload.subarray(0, 48))}`);
+    return null;
+  }
 }
 
 /**

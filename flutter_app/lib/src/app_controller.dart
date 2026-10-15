@@ -62,10 +62,6 @@ class AppController extends ChangeNotifier {
   /// 'auto' probiert die bekannten Treiber aus; sonst ein fester Treibername
   /// ('soulear' oder 'airlook').
   String driver = 'auto';
-
-  /// True once the user edited the IP themselves. Then the IP is kept when the
-  /// driver changes instead of falling back to the driver's default.
-  bool _ipUserEdited = false;
   StabilizeSettings stabilize = const StabilizeSettings();
   List<File> photos = [];
   bool connecting = false;
@@ -75,10 +71,8 @@ class AppController extends ChangeNotifier {
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
     driver = _prefs.getString('driver') ?? driver;
-    _ipUserEdited = _prefs.getBool('ipUserEdited') ?? false;
-    // An explicitly saved IP wins; otherwise use the selected driver's default.
-    cameraIp = _prefs.getString('cameraIp') ??
-        (_ipUserEdited ? cameraIp : defaultIpFor(driver));
+    // Use the saved IP if present, otherwise the selected driver's default.
+    cameraIp = _prefs.getString('cameraIp') ?? defaultIpFor(driver);
     stabilize = StabilizeSettings(
       enabled: _prefs.getBool('stab.enabled') ?? false,
       invert: _prefs.getBool('stab.invert') ?? false,
@@ -155,20 +149,18 @@ class AppController extends ChangeNotifier {
 
   Future<void> setCameraIp(String ip) async {
     cameraIp = ip.trim();
-    _ipUserEdited = true;
     await _prefs.setString('cameraIp', cameraIp);
-    await _prefs.setBool('ipUserEdited', true);
     notifyListeners();
     await connect();
   }
 
-  /// Switches the driver. The IP follows the selected driver's default, unless
-  /// the user edited the IP explicitly before.
+  /// Switches the device (driver). The IP is always set to the new driver's
+  /// default, so the IP field and the config follow the selected device.
   Future<void> setDriver(String name) async {
     driver = name.trim();
-    if (!_ipUserEdited) cameraIp = defaultIpFor(driver);
+    cameraIp = defaultIpFor(driver);
     await _prefs.setString('driver', driver);
-    if (!_ipUserEdited) await _prefs.setString('cameraIp', cameraIp);
+    await _prefs.setString('cameraIp', cameraIp);
     notifyListeners();
     await connect();
   }
